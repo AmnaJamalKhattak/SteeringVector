@@ -347,12 +347,14 @@ class FluxSteering:
             ),
             "pincer_v2": (
                 f"  - Entry-Point-Only (EPO) steering:\n"
-                f"  - CLIP source (time_text_embed): 1 layer, gentle beta\n"
-                f"  - T5 source (context_embedder): 1 layer, mask-aware pooling, moderate beta\n"
-                f"  - Total vectors: {2 * self.n_steps} (2 layers x {self.n_steps} steps)\n"
-                f"  - No image patches hooked (avoids background entanglement)\n"
-                f"  - Per-component beta: beta={{'clip': 3.0, 't5': 5.0}}\n"
-                f"  - CLIP steered as PRE-HOOK on time_text_embed INPUT (768-d, before SiLU)"
+                f"  - CLIP direction (768-d) -> pre-hook on time_text_embed INPUT (before SiLU)\n"
+                f"  - T5   direction (4096-d) -> pre-hook on context_embedder INPUT\n"
+                f"    (raw T5 hidden states, before Linear + downstream AdaLayerNormZero)\n"
+                f"  - CLIP score capped at min(beta_clip, 1.0) to prevent over-removal\n"
+                f"  - T5 hook supports top-k token gating (top_frac) + step gating (step_range)\n"
+                f"  - Object: top_frac=0.15, step_range=(0,2), beta={{'clip':1, 't5':4}}\n"
+                f"  - Style : top_frac=1.0,  step_range=(0,{self.n_steps}), beta={{'clip':0, 't5':2}}\n"
+                f"  - No image patches hooked (avoids background entanglement)"
             ),
         }
         print(f"FluxSteering initialized (mode={mode}):")
@@ -390,6 +392,25 @@ class FluxSteering:
         weighted = (act * mask_exp).sum(dim=(0, 1))
         count = mask_exp.sum(dim=(0, 1)).clamp(min=1.0)
         return weighted / count
+
+    def _get_t5_embeddings_and_mask(self, prompt):
+        """Raw T5 hidden states (1, seq, 4096) + attention mask (1, seq).
+
+        This is the T5 analog of `_get_clip_prompt_embeds`: the per-token
+        output of the T5 encoder BEFORE `transformer.context_embedder`.
+        Used to learn a 4096-d T5 steering direction without running the
+        denoising pipeline.
+        """
+        max_seq = getattr(self.pipe, '_max_sequence_length', 512)
+        mask, _ = self._get_t5_mask(prompt)
+        embeds = self.pipe._get_t5_prompt_embeds(
+            prompt=prompt,
+            num_images_per_prompt=1,
+            max_sequence_length=max_seq,
+            device=self.device,
+            dtype=self.pipe.text_encoder_2.dtype,
+        )
+        return embeds.float(), mask
 
     def _run_pipe_base(self, prompt, seed, steps=None):
         steps = steps or self.n_steps
@@ -470,88 +491,58 @@ class FluxSteering:
     # ==================================================================
     def _learn_pincer_v2(self, pos_prompt, neg_prompt, seeds, verbose):
         """
-        Entry-Point-Only (EPO) steering for object unlearning.
+        Entry-Point-Only (EPO) steering — direct-embedding learning.
 
-        CLIP path: Directly compute 768-d CLIP pooled embeddings via
-          _get_clip_prompt_embeds (no pipeline run needed). Steered as a
-          pre-hook on time_text_embed INPUT, BEFORE the SiLU nonlinearity.
+        Both text paths are learned directly from their encoder outputs,
+        so no pipeline runs are needed.
 
-        T5 path: Hook context_embedder OUTPUT with mask-aware mean pooling
-          (unchanged — context_embedder is a pure Linear, no nonlinearity).
+        CLIP path (768-d): `_get_clip_prompt_embeds` → pooled embedding.
+          Steered as a pre-hook on `time_text_embed` INPUT (pre-SiLU).
 
-        Total: n_steps + 1 vectors (context_embedder per-step + 1 clip_768).
+        T5 path (4096-d): `_get_t5_prompt_embeds` → raw per-token hidden
+          states, mask-aware mean pooled. Steered as a pre-hook on
+          `context_embedder` INPUT, BEFORE the downstream AdaLayerNormZero
+          in every FluxTransformerBlock renormalizes the tokens.
+
+        Produces two vectors: `clip_768` (key) and `t5_4096` (key), each a
+        single direction at step 0 (applied at every denoising step).
+        `seeds` is ignored (kept in the signature for API compatibility).
         """
-        pos_mask, pos_n = self._get_t5_mask(pos_prompt)
-        neg_mask, neg_n = self._get_t5_mask(neg_prompt)
         if verbose:
-            print(f"EPO learning: CLIP via _get_clip_prompt_embeds (768-d, pre-SiLU)")
-            print(f"EPO learning: context_embedder via output hooks (mask-aware)")
-            print(f"T5 mask: pos has {pos_n} real tokens, neg has {neg_n} real tokens (out of {pos_mask.shape[1]})")
+            print(f"EPO learning (direct): CLIP 768-d + T5 4096-d, no pipeline runs")
 
-        # --- CLIP: direct embedding, no pipeline run needed ---
+        # --- CLIP: direct pooled embedding ---
         clip_pos = self.pipe._get_clip_prompt_embeds(
             prompt=pos_prompt, device=self.device
-        )  # (1, 768)
+        ).squeeze(0).float()  # (768,)
         clip_neg = self.pipe._get_clip_prompt_embeds(
             prompt=neg_prompt, device=self.device
-        )  # (1, 768)
-        clip_diff = (clip_pos.squeeze(0) - clip_neg.squeeze(0)).float()
+        ).squeeze(0).float()
+        clip_diff = clip_pos - clip_neg
         clip_strength = float(clip_diff.norm())
         clip_direction = clip_diff / (clip_diff.norm() + 1e-8)
+
+        # --- T5: raw per-token embeddings, mask-aware mean pool ---
+        t5_pos, pos_mask = self._get_t5_embeddings_and_mask(pos_prompt)  # (1,seq,4096)
+        t5_neg, neg_mask = self._get_t5_embeddings_and_mask(neg_prompt)
+        t5_pos_pool = self._masked_mean(t5_pos, pos_mask)  # (4096,)
+        t5_neg_pool = self._masked_mean(t5_neg, neg_mask)
+        t5_diff = t5_pos_pool - t5_neg_pool
+        t5_strength = float(t5_diff.norm())
+        t5_direction = t5_diff / (t5_diff.norm() + 1e-8)
+
         if verbose:
-            print(f"CLIP direction: dim={clip_direction.shape[0]}, strength={clip_strength:.4f}")
-
-        # --- T5 / context_embedder: still needs pipeline runs with hooks ---
-        mean_diffs = defaultdict(lambda: defaultdict(float))
-        counts = defaultdict(lambda: defaultdict(int))
-
-        def hook_fn(layer_name, sign):
-            def hook(module, inputs, output):
-                step = self._current_step + 1
-                if 0 <= step < self.n_steps:
-                    act = output.detach().float()
-                    if act.dim() == 3:
-                        mean_act = self._masked_mean(act, self._current_attention_mask)
-                    else:
-                        mean_act = act.mean(dim=tuple(range(act.dim() - 1)))
-                    mean_diffs[layer_name][step] += (sign * mean_act)
-                    counts[layer_name][step] += 1
-                return output
-            return hook
-
-        ctx_mod = self.target_layers["context_embedder"]
-
-        def _run_pass(prompt, mask, sign, desc):
-            self._current_attention_mask = mask
-            for seed in tqdm(seeds, desc=desc, disable=not verbose):
-                self._clear_hooks()
-                # Hook ONLY context_embedder (T5 path)
-                self._handles.append(ctx_mod.register_forward_hook(
-                    hook_fn("context_embedder", sign)
-                ))
-                self._run_pipe_base(prompt, seed)
-
-        try:
-            _run_pass(pos_prompt, pos_mask, +1, "EPO T5 learning (+)")
-            _run_pass(neg_prompt, neg_mask, -1, "EPO T5 learning (-)")
-        finally:
-            self._clear_hooks()
-            self._current_attention_mask = None
-
-        # Build T5 vectors
-        vectors = dict(self._build_vectors_keep_all(
-            mean_diffs, counts, len(seeds), verbose,
-            title="EPO Steering Vectors — T5 / context_embedder"
-        ))
-
-        # Add CLIP vector under key "clip_768", step 0 (same at every step)
-        vectors["clip_768"] = {0: clip_direction}
-        if verbose:
+            print(f"{'Layer':<25} {'Step':<6} {'Strength':<12}")
+            print(f"{'-'*70}")
             print(f"{'clip_768':<25} {'0':<6} {clip_strength:<12.4f}")
-            total = sum(len(v) for v in vectors.values())
-            print(f"Total vectors (incl. clip_768): {total}")
+            print(f"{'t5_4096':<25} {'0':<6} {t5_strength:<12.4f}")
+            print(f"{'-'*70}")
+            print(f"Total vectors: 2 (clip_768 + t5_4096)")
 
-        return vectors
+        return {
+            "clip_768": {0: clip_direction},
+            "t5_4096": {0: t5_direction},
+        }
 
     # ==================================================================
     # LEARN: learn_vectors_diverse (MULTI-PROMPT)
@@ -562,18 +553,80 @@ class FluxSteering:
         Learn steering vectors from DIVERSE prompt pairs (CASteer methodology).
 
         For each (pos_prompt, neg_prompt) pair:
-          1. Run pipeline with pos_prompt (seed=seed) -> collect activations
-          2. Run pipeline with neg_prompt (seed=seed) -> collect activations
-          3. Accumulate: diff += activation(pos) - activation(neg)
+          1. Get activations for pos_prompt, neg_prompt
+          2. Accumulate: diff += activation(pos) - activation(neg)
         Final vector = mean(diffs) / ||mean(diffs)||
 
         The diverse contexts cancel out, leaving only the concept-specific direction.
+
+        pincer_v2 mode: computes CLIP (768-d) and T5 (4096-d) directions
+        DIRECTLY from `_get_clip_prompt_embeds` and `_get_t5_prompt_embeds`
+        — no pipeline runs, so learning is orders of magnitude faster.
+
+        hybrid mode: unchanged — runs the pipeline with hooks on
+        context_embedder + time_text_embed + add_k_proj + add_q_proj.
         """
         n_pairs = len(prompt_pairs)
         if verbose:
             print(f"Learning from {n_pairs} diverse prompt pairs (seed={seed})")
             print(f"Mode: {self.mode}")
 
+        # ------------------------------------------------------------------
+        # pincer_v2: direct-embedding path (no pipeline runs)
+        # ------------------------------------------------------------------
+        if self.mode == "pincer_v2":
+            clip_diff_accum = None
+            t5_diff_accum = None
+            for pair_idx, (pos_prompt, neg_prompt) in enumerate(
+                tqdm(prompt_pairs, desc="Diverse pairs (CLIP+T5 direct)", disable=not verbose)
+            ):
+                # CLIP (pooled, 768-d)
+                clip_pos = self.pipe._get_clip_prompt_embeds(
+                    prompt=pos_prompt, device=self.device
+                ).squeeze(0).float()
+                clip_neg = self.pipe._get_clip_prompt_embeds(
+                    prompt=neg_prompt, device=self.device
+                ).squeeze(0).float()
+                d_clip = clip_pos - clip_neg
+
+                # T5 (per-token 4096-d → mask-aware mean pool)
+                t5_pos, pos_mask = self._get_t5_embeddings_and_mask(pos_prompt)
+                t5_neg, neg_mask = self._get_t5_embeddings_and_mask(neg_prompt)
+                d_t5 = self._masked_mean(t5_pos, pos_mask) - self._masked_mean(t5_neg, neg_mask)
+
+                clip_diff_accum = d_clip if clip_diff_accum is None else clip_diff_accum + d_clip
+                t5_diff_accum = d_t5 if t5_diff_accum is None else t5_diff_accum + d_t5
+
+                if verbose and (pair_idx + 1) % 10 == 0:
+                    print(f"  Completed {pair_idx + 1}/{n_pairs} prompt pairs")
+
+            clip_avg = clip_diff_accum / n_pairs
+            t5_avg = t5_diff_accum / n_pairs
+            clip_strength = float(clip_avg.norm())
+            t5_strength = float(t5_avg.norm())
+            clip_direction = clip_avg / (clip_avg.norm() + 1e-8)
+            t5_direction = t5_avg / (t5_avg.norm() + 1e-8)
+
+            if verbose:
+                print(f"\n{'='*70}")
+                print(f"Diverse-Prompt Steering Vectors (pincer_v2, {n_pairs} pairs)")
+                print(f"{'='*70}")
+                print(f"{'Layer':<25} {'Step':<6} {'Strength':<12}")
+                print(f"{'-'*70}")
+                print(f"{'clip_768':<25} {'0':<6} {clip_strength:<12.4f}")
+                print(f"{'t5_4096':<25} {'0':<6} {t5_strength:<12.4f}")
+                print(f"{'-'*70}")
+                print(f"Total vectors: 2 (clip_768 + t5_4096)")
+                print(f"{'='*70}\n")
+
+            return {
+                "clip_768": {0: clip_direction},
+                "t5_4096": {0: t5_direction},
+            }
+
+        # ------------------------------------------------------------------
+        # hybrid: legacy pipeline-with-hooks path (unchanged)
+        # ------------------------------------------------------------------
         mean_diffs = defaultdict(lambda: defaultdict(float))
         counts = defaultdict(lambda: defaultdict(int))
 
@@ -631,51 +684,16 @@ class FluxSteering:
                         return hook
                     hooks.append((mod, make_addq_hook(li, sign)))
 
-            elif self.mode == "pincer_v2":
-                # EPO: hook ONLY context_embedder (T5 path).
-                # CLIP is handled separately via _get_clip_prompt_embeds below.
-                ctx_mod = self.target_layers["context_embedder"]
-                def make_ctx_hook(s):
-                    def hook(module, inputs, output):
-                        step = self._current_step + 1
-                        if 0 <= step < self.n_steps:
-                            act = output.detach().float()
-                            if act.dim() == 3:
-                                mean_act = self._masked_mean(act, self._current_attention_mask)
-                            else:
-                                mean_act = act.mean(dim=tuple(range(act.dim() - 1)))
-                            mean_diffs["context_embedder"][step] += (s * mean_act)
-                            counts["context_embedder"][step] += 1
-                        return output
-                    return hook
-                hooks.append((ctx_mod, make_ctx_hook(sign)))
-
             return hooks
-
-        # For pincer_v2: accumulate CLIP embeddings directly (no pipeline needed)
-        clip_diff_accum = None
 
         try:
             for pair_idx, (pos_prompt, neg_prompt) in enumerate(
                 tqdm(prompt_pairs, desc="Diverse prompt pairs", disable=not verbose)
             ):
-                pos_mask, pos_n = self._get_t5_mask(pos_prompt)
-                neg_mask, neg_n = self._get_t5_mask(neg_prompt)
+                pos_mask, _ = self._get_t5_mask(pos_prompt)
+                neg_mask, _ = self._get_t5_mask(neg_prompt)
 
-                # For pincer_v2: compute CLIP embeddings directly
-                if self.mode == "pincer_v2":
-                    clip_pos = self.pipe._get_clip_prompt_embeds(
-                        prompt=pos_prompt, device=self.device
-                    ).squeeze(0).float()
-                    clip_neg = self.pipe._get_clip_prompt_embeds(
-                        prompt=neg_prompt, device=self.device
-                    ).squeeze(0).float()
-                    if clip_diff_accum is None:
-                        clip_diff_accum = clip_pos - clip_neg
-                    else:
-                        clip_diff_accum += clip_pos - clip_neg
-
-                # Positive pass (T5 hooks for pincer_v2, all hooks for hybrid)
+                # Positive pass
                 self._clear_hooks()
                 self._current_attention_mask = pos_mask
                 for mod, hook_fn in _get_hooks_for_mode(+1):
@@ -696,24 +714,10 @@ class FluxSteering:
             self._clear_hooks()
             self._current_attention_mask = None
 
-        # Build T5/context_embedder (+ hybrid add_k/q) vectors
-        vectors = dict(self._build_vectors_keep_all(
+        return dict(self._build_vectors_keep_all(
             mean_diffs, counts, n_pairs, verbose,
             title=f"Diverse-Prompt Steering Vectors ({self.mode}, {n_pairs} pairs)"
         ))
-
-        # For pincer_v2: add normalized CLIP direction under "clip_768"
-        if self.mode == "pincer_v2" and clip_diff_accum is not None:
-            clip_avg = clip_diff_accum / n_pairs
-            clip_strength = float(clip_avg.norm())
-            clip_direction = clip_avg / (clip_avg.norm() + 1e-8)
-            vectors["clip_768"] = {0: clip_direction}
-            if verbose:
-                print(f"{'clip_768':<25} {'0':<6} {clip_strength:<12.4f}")
-                total = sum(len(v) for v in vectors.values())
-                print(f"Total vectors (incl. clip_768): {total}")
-
-        return vectors
 
     # ==================================================================
     # Vector builders
@@ -779,29 +783,37 @@ class FluxSteering:
     # APPLY VECTORS
     # ==================================================================
     @contextmanager
-    def apply_vectors(self, vectors, beta=2.0, clip_negative=True):
+    def apply_vectors(self, vectors, beta=2.0, clip_negative=True,
+                      top_frac=None, step_range=None):
         """
         Context manager to apply steering vectors during generation.
 
-        For clip_768 vectors: register_forward_pre_hook on time_text_embed
-          to steer pooled_projections (768-d) BEFORE the SiLU nonlinearity.
-        For all other vectors: register_forward_hook on output (unchanged).
+        Hook points (pincer_v2 / EPO):
+          - "clip_768"  -> PRE-hook on time_text_embed input (768-d, pre-SiLU).
+          - "t5_4096"   -> PRE-hook on context_embedder input (4096-d, pre-AdaLN).
+        Hook points (hybrid + legacy):
+          - "context_embedder", "time_text_embed": output hooks.
+          - "add_k_<i>", "add_q_<i>": output hooks on text-side K/Q projections.
+          - "double_<i>": output hook on attn.to_out[0] (legacy).
 
         Args:
-            vectors: dict from learn_vectors / learn_vectors_diverse
-            beta: Steering strength. Can be:
-                  - float: same beta for all layers
-                  - dict with per-component beta:
-                    "clip" applies to clip_768 (pre-hook on time_text_embed input)
-                    "t5" applies to context_embedder
-                    "attn" applies to add_k_proj, add_q_proj (hybrid mode)
-            clip_negative: if True, only remove positive projections
+            vectors: dict from learn_vectors / learn_vectors_diverse.
+            beta: float or dict {"clip": .., "t5": .., "attn": ..}.
+            clip_negative: if True, only remove positive projections.
+            top_frac: if not None and <1.0, only subtract on the top-k tokens
+                of each T5 sequence (k = int(top_frac * seq_len)). Used to
+                localize OBJECT removal to concept tokens, preserving scene
+                tokens. Applies to the T5 pre-hook and to legacy T5 output
+                hook. For style use top_frac=None or 1.0 (diffuse signal).
+            step_range: (start, end) tuple; steering fires only when
+                start <= step < end. Indices are 0-based denoising step
+                indices. None means "every step" (legacy behaviour).
         """
         # Parse per-component beta
         if isinstance(beta, dict):
             beta_clip = beta.get("clip", 3.0)
             beta_t5 = beta.get("t5", 5.0)
-            beta_attn = beta.get("attn", beta_t5)  # fallback to t5 if attn not set
+            beta_attn = beta.get("attn", beta_t5)
             beta_default = beta.get("default", beta_attn)
         else:
             beta_clip = beta
@@ -809,96 +821,143 @@ class FluxSteering:
             beta_attn = beta
             beta_default = beta
 
-        def steer_hook(layer_vectors, layer_beta):
-            """Standard forward hook: steers module OUTPUT."""
+        # Step gating
+        if step_range is None:
+            def _in_range(step):
+                return True
+        else:
+            s_start, s_end = step_range
+            def _in_range(step):
+                return s_start <= step < s_end
+
+        # Top-k token gating (only meaningful for sequence tensors)
+        use_topk = top_frac is not None and top_frac < 1.0
+
+        def _apply_topk_gate(score):
+            T = score.shape[-1]
+            k = max(1, int(top_frac * T))
+            thresh = score.topk(k, dim=-1).values[..., -1:]
+            return score * (score >= thresh).to(score.dtype)
+
+        def output_hook(layer_vectors, layer_beta, token_gate=False):
+            """Output hook: subtract direction from module output.
+
+            token_gate=True enables top_frac gating on per-token scores
+            (used for the legacy T5 context_embedder output hook).
+            """
             def hook(module, inputs, output):
                 step = self._current_step + 1
-                if step in layer_vectors:
-                    target_dir = layer_vectors[step].to(output.device, output.dtype)
-                    score = (output @ target_dir)
-                    if clip_negative:
-                        score = torch.clamp(score, min=0.0)
-                    update = (layer_beta * score).unsqueeze(-1) * target_dir
-                    return output - update
-                return output
+                if step not in layer_vectors or not _in_range(step):
+                    return output
+                d = layer_vectors[step].to(output.device, output.dtype)
+                score = output @ d
+                if clip_negative:
+                    score = score.clamp(min=0.0)
+                if token_gate and use_topk and score.dim() >= 2:
+                    score = _apply_topk_gate(score)
+                update = (layer_beta * score).unsqueeze(-1) * d
+                return output - update
             return hook
 
-        def clip_pre_hook(clip_direction, clip_beta):
-            """Forward PRE-hook: steers pooled_projections INPUT to time_text_embed,
-            BEFORE the SiLU nonlinearity. pooled_projections is always the last arg."""
+        def clip_pre_hook(direction, b_clip):
+            """PRE-hook on time_text_embed. `pooled_projections` is the last
+            positional arg. Cap score at its own magnitude so β_clip > 1
+            cannot over-remove past the concept-free point."""
             def hook(module, args):
-                pooled = args[-1]  # always last arg, shape (B, 768)
-                d = clip_direction.to(pooled.device, pooled.dtype)
-                score = (pooled @ d)  # (B,)
+                step = self._current_step + 1
+                if not _in_range(step):
+                    return None
+                pooled = args[-1]
+                d = direction.to(pooled.device, pooled.dtype)
+                score = (pooled @ d)
                 if clip_negative:
-                    score = torch.clamp(score, min=0.0)
-                update = (clip_beta * score).unsqueeze(-1) * d  # (B, 768)
-                pooled_steered = pooled - update
-                return args[:-1] + (pooled_steered,)
+                    score = score.clamp(min=0.0)
+                effective = min(float(b_clip), 1.0) * score
+                update = effective.unsqueeze(-1) * d
+                return args[:-1] + (pooled - update,)
+            return hook
+
+        def t5_pre_hook(direction, b_t5):
+            """PRE-hook on context_embedder. Operates on raw T5 hidden
+            states (B, seq, 4096) BEFORE the Linear projection — so the
+            downstream AdaLayerNormZero in every FluxTransformerBlock
+            cannot renormalize the subtraction away."""
+            def hook(module, args):
+                step = self._current_step + 1
+                if not _in_range(step):
+                    return None
+                x = args[0]
+                d = direction.to(x.device, x.dtype)
+                score = (x @ d)
+                if clip_negative:
+                    score = score.clamp(min=0.0)
+                if use_topk:
+                    score = _apply_topk_gate(score)
+                update = (b_t5 * score).unsqueeze(-1) * d
+                return (x - update,) + args[1:]
             return hook
 
         try:
             self._clear_hooks()
-
             for li, step_vecs in vectors.items():
                 li_str = str(li)
 
-                # --- clip_768: pre-hook on time_text_embed input ---
                 if li_str == "clip_768":
-                    # clip_768 has a single direction at step 0, applied every step
-                    direction = step_vecs[0]
                     self._handles.append(
                         self.target_layers["time_text_embed"].register_forward_pre_hook(
-                            clip_pre_hook(direction, beta_clip)
+                            clip_pre_hook(step_vecs[0], beta_clip)
                         )
                     )
 
-                # --- context_embedder: standard output hook ---
+                elif li_str == "t5_4096":
+                    self._handles.append(
+                        self.target_layers["context_embedder"].register_forward_pre_hook(
+                            t5_pre_hook(step_vecs[0], beta_t5)
+                        )
+                    )
+
                 elif li_str == "context_embedder":
+                    # Legacy: T5 output hook in 3072-d. Kept for old saved
+                    # vectors. Prefer "t5_4096" pre-hook for new runs.
                     self._handles.append(
                         self.target_layers["context_embedder"].register_forward_hook(
-                            steer_hook(step_vecs, beta_t5)
+                            output_hook(step_vecs, beta_t5, token_gate=True)
                         )
                     )
 
-                # --- time_text_embed: standard output hook (hybrid mode) ---
                 elif li_str == "time_text_embed":
                     self._handles.append(
                         self.target_layers["time_text_embed"].register_forward_hook(
-                            steer_hook(step_vecs, beta_clip)
+                            output_hook(step_vecs, beta_clip)
                         )
                     )
 
-                # --- add_k_proj (hybrid mode) ---
                 elif li_str.startswith("add_k_"):
                     idx = int(li_str.split("_")[-1])
                     if idx in self.double_add_k:
                         self._handles.append(
                             self.double_add_k[idx].register_forward_hook(
-                                steer_hook(step_vecs, beta_attn)
+                                output_hook(step_vecs, beta_attn)
                             )
                         )
 
-                # --- add_q_proj (hybrid mode) ---
                 elif li_str.startswith("add_q_"):
                     idx = int(li_str.split("_")[-1])
                     if idx in self.double_add_q:
                         self._handles.append(
                             self.double_add_q[idx].register_forward_hook(
-                                steer_hook(step_vecs, beta_attn)
+                                output_hook(step_vecs, beta_attn)
                             )
                         )
 
-                # --- Double-stream to_out[0] (legacy) ---
                 elif li_str.startswith("double_"):
                     idx = int(li_str.split("_")[1])
                     if idx in self.double_proj_layers:
                         self._handles.append(
                             self.double_proj_layers[idx].register_forward_hook(
-                                steer_hook(step_vecs, beta_default)
+                                output_hook(step_vecs, beta_default)
                             )
                         )
-
             yield
         finally:
             self._clear_hooks()
@@ -906,7 +965,8 @@ class FluxSteering:
     # ==================================================================
     # GENERATE
     # ==================================================================
-    def generate(self, prompt, seed, vectors=None, beta=2.0, clip_negative=True):
+    def generate(self, prompt, seed, vectors=None, beta=2.0, clip_negative=True,
+                 top_frac=None, step_range=None):
         """Generate image with optional steering.
 
         Args:
@@ -918,9 +978,16 @@ class FluxSteering:
                   - dict {"clip": 1.5, "t5": 3.0}: per-component beta
                     (pincer_v2/EPO: gentle CLIP, moderate T5)
             clip_negative: If True, only remove positive projections
+            top_frac: Top-k token gating fraction for T5 hooks (0<f<=1).
+                      Objects use ~0.15 to localize to concept tokens.
+                      Style uses 1.0 (no gating, style is diffuse).
+            step_range: Tuple (start, end) of denoising steps to steer.
+                        Objects use (0, 2) — identity is committed early.
+                        Style uses (0, N_STEPS) — style is painted throughout.
         """
         if vectors:
-            with self.apply_vectors(vectors, beta=beta, clip_negative=clip_negative):
+            with self.apply_vectors(vectors, beta=beta, clip_negative=clip_negative,
+                                    top_frac=top_frac, step_range=step_range):
                 return self._run_pipe_base(prompt, seed)
         else:
             return self._run_pipe_base(prompt, seed)
@@ -1480,6 +1547,8 @@ class UnlearnCanvasEvaluator:
         target_type="style",
         beta=2.0,
         clip_negative=True,
+        top_frac=None,
+        step_range=None,
         eval_seeds=None,
         save_images=True,
         output_dir=None,
@@ -1533,7 +1602,7 @@ class UnlearnCanvasEvaluator:
         generated = 0
         print(f"\n--- PHASE 1: IMAGE GENERATION ---")
         print(f"Grid: {len(STYLES)} styles x {len(OBJECTS)} objects x {len(eval_seeds)} seeds = {total_images} images")
-        print(f"Steering: beta={beta}")
+        print(f"Steering: beta={beta}, top_frac={top_frac}, step_range={step_range}")
         print(f"Output: {output_dir}")
 
         for i, case in enumerate(tqdm(test_cases, desc="Phase 1: Generating")):
@@ -1549,7 +1618,9 @@ class UnlearnCanvasEvaluator:
                 case["seed"],
                 vectors=vectors,
                 beta=beta,
-                clip_negative=clip_negative
+                clip_negative=clip_negative,
+                top_frac=top_frac,
+                step_range=step_range,
             )
             img.save(save_path)
             generated += 1
@@ -1728,7 +1799,8 @@ print("✓ FLUX pipeline loaded")
 #   "hybrid"     -> entry points + add_k/add_q (STYLE unlearning)
 #   "pincer_v2"  -> CLIP + add_k/add_q with per-component beta (OBJECT unlearning)
 #                   Use beta={"clip": 3.0, "attn": 12.0} for independent control
-STEERING_MODE = "hybrid"  # Change to "hybrid" for style unlearning
+STEERING_MODE = "pincer_v2"  # EPO-style steering for BOTH objects and style
+                             # (hybrid retained only for backward compat with old vectors)
 print(f"\nInitializing FluxSteering (mode={STEERING_MODE})...")
 steerer = FluxSteering(pipe, device=DEVICE, n_steps=N_STEPS, mode=STEERING_MODE)
 
@@ -1754,20 +1826,30 @@ Change TARGET_CONCEPT and TARGET_TYPE for different experiments.
 # ==========================================================================
 TARGET_CONCEPT = "Watercolor"        # Concept to unlearn (e.g., "Dog", "Van_Gogh")
 TARGET_TYPE = "style"        # "style" or "object"
-# Steering strength:
-#   Style (hybrid mode): beta=2-5 works well (single float)
-#   Objects (pincer_v2 / EPO mode): per-component beta dict
-#     "clip"  -> gentle (CLIP controls ALL 57 blocks via AdaLN, fragile)
-#     "t5"    -> moderate (T5 only enters attention K/Q, more localized)
-#   EPO needs LOWER betas than old pincer_v2 because it removes the concept
-#   BEFORE it influences image generation (upstream = less force needed).
-#   Suggested search grid:
-#     clip: [0.5, 1.0, 1.5, 2.0, 3.0]
-#     t5:   [1.0, 2.0, 3.0, 5.0]
+# Steering defaults — both types use the same two entry-point hooks
+# (pre-hook on time_text_embed for CLIP-768, pre-hook on context_embedder
+# for T5-4096). Only the knobs differ:
+#
+#   OBJECT — identity lives in CLIP pooled + a few T5 concept tokens.
+#            Top-k gate T5 to concept tokens, steer only the first 1-2
+#            denoising steps, CLIP cap prevents over-removal.
+#     BETA       = {"clip": 1.0, "t5": 4.0}
+#     TOP_FRAC   = 0.15   # top 15% of real T5 tokens per prompt
+#     STEP_RANGE = (0, 2) # identity is committed early
+#
+#   STYLE  — style is diffuse across every real T5 token and painted
+#            throughout denoising. CLIP carries identity (keep at 0).
+#     BETA       = {"clip": 0.0, "t5": 2.0}
+#     TOP_FRAC   = 1.0    # no gating
+#     STEP_RANGE = (0, N_STEPS)
 if TARGET_TYPE == "style":
-    BETA = 2.0
+    BETA = {"clip": 0.0, "t5": 2.0}
+    TOP_FRAC = 1.0
+    STEP_RANGE = (0, N_STEPS)
 else:
-    BETA = {"clip": 3.0, "t5": 5.0}
+    BETA = {"clip": 1.0, "t5": 4.0}
+    TOP_FRAC = 0.15
+    STEP_RANGE = (0, 2)
 
 # ==========================================================================
 # Automatic configuration
@@ -1797,18 +1879,25 @@ print(f"Target Concept:    {TARGET_CONCEPT}")
 print(f"Target Type:       {TARGET_TYPE}")
 print(f"Steering Mode:     {STEERING_MODE}")
 print(f"Steering Strength: \u03b2 = {BETA}")
+print(f"Top-k gating:      top_frac = {TOP_FRAC}")
+print(f"Step range:        {STEP_RANGE}")
 if TARGET_TYPE == "object":
     print(f"Prompt Strategy:   {len(DIVERSE_PROMPT_PAIRS)} diverse pairs (CASteer methodology)")
     print(f"  Example pos:     '{DIVERSE_PROMPT_PAIRS[0][0]}'")
     print(f"  Example neg:     '{DIVERSE_PROMPT_PAIRS[0][1]}'")
-    print(f"  Rationale:       Averaging across 50 contexts cancels non-Dog info,")
-    print(f"                   isolating the 'Dog' direction so ONLY the dog is removed.")
-    print(f"  EPO approach:    Steers at entry points only (no image patches)")
+    print(f"  Rationale:       Averaging across 50 contexts cancels non-concept info,")
+    print(f"                   isolating the target direction. Top-k gate + early-step")
+    print(f"                   gating localize removal to concept tokens in steps 0-1.")
+    print(f"  EPO approach:    Pre-hook on time_text_embed (CLIP-768) capped at 1.0;")
+    print(f"                   pre-hook on context_embedder (T5-4096) with top-k gate.")
     print(f"                   clip={BETA.get('clip', 'N/A')}, t5={BETA.get('t5', 'N/A')}")
 else:
     print(f"Prompt Strategy:   {len(DIVERSE_PROMPT_PAIRS)} diverse pairs")
     print(f"  Example pos:     '{DIVERSE_PROMPT_PAIRS[0][0]}'")
     print(f"  Example neg:     '{DIVERSE_PROMPT_PAIRS[0][1]}'")
+    print(f"  EPO approach:    Pre-hook on context_embedder (T5-4096); no top-k gate")
+    print(f"                   (style is diffuse); steer every denoising step.")
+    print(f"                   clip={BETA.get('clip', 'N/A')}, t5={BETA.get('t5', 'N/A')}")
 print(f"Eval Seeds:        {len(EVAL_SEEDS)}")
 print(f"Output Directory:  {OUTPUT_DIR}")
 print("="*70)
@@ -1913,33 +2002,42 @@ print("\nGenerating baseline (no steering)...")
 baseline_img = steerer.generate(DIAG_PROMPT, DIAG_SEED, vectors=None)
 
 # --- Test configurations ---
-# For pincer_v2 (EPO): test per-component beta dicts with "clip" and "t5" keys
-#   EPO steers upstream so needs LOWER betas than old pincer_v2.
-#   Search grid: clip=[0.5, 1.0, 1.5, 2.0, 3.0], t5=[1.0, 2.0, 3.0, 5.0]
-# For hybrid: test scalar betas
-if STEERING_MODE == "pincer_v2":
+# Object sweep: fix BETA={clip=1,t5=4}, vary top_frac x step_range to find
+#   the setting that removes the concept while preserving the scene.
+# Style  sweep: fix top_frac=1.0, step_range=(0,N_STEPS), clip=0, vary t5.
+if STEERING_MODE == "pincer_v2" and TARGET_TYPE == "object":
+    base_beta = {"clip": 1.0, "t5": 4.0}
     configs = [
-        ("clip=3,t5=0",         {"clip": 3.0, "t5": 0.0},   True),
-        ("clip=3,t5=1.5",         {"clip": 3.0, "t5": 1.5},   True),
-        ("clip=3,t5=3",         {"clip": 3.0, "t5": 3.0},   True),
-        ("clip=3,t5=3.5",        {"clip": 3.0, "t5": 3.5},  True),
-        ("clip=3,t5=4",  {"clip": 3.0, "t5": 5.0},   True),
-
+        ("top=0.10 steps=(0,1)", base_beta, True, 0.10, (0, 1)),
+        ("top=0.15 steps=(0,2)", base_beta, True, 0.15, (0, 2)),
+        ("top=0.20 steps=(0,2)", base_beta, True, 0.20, (0, 2)),
+        ("top=0.40 steps=(0,2)", base_beta, True, 0.40, (0, 2)),
+        ("top=0.15 steps=(0,4)", base_beta, True, 0.15, (0, N_STEPS)),
+    ]
+elif STEERING_MODE == "pincer_v2" and TARGET_TYPE == "style":
+    configs = [
+        ("clip=0,t5=1", {"clip": 0.0, "t5": 1.0}, True, 1.0, (0, N_STEPS)),
+        ("clip=0,t5=2", {"clip": 0.0, "t5": 2.0}, True, 1.0, (0, N_STEPS)),
+        ("clip=0,t5=3", {"clip": 0.0, "t5": 3.0}, True, 1.0, (0, N_STEPS)),
+        ("clip=0,t5=4", {"clip": 0.0, "t5": 4.0}, True, 1.0, (0, N_STEPS)),
+        ("clip=0,t5=2, steps=(0,2)", {"clip": 0.0, "t5": 2.0}, True, 1.0, (0, 2)),
     ]
 else:
+    # Legacy hybrid path — scalar beta sweep, no top_frac / step_range.
     configs = [
-        ("β=0, clip_neg=True",   0.0,  True),
-        ("β=1, clip_neg=True",   1.0,  True),
-        ("β=2, clip_neg=True",  2.0, True),
-        ("β=3, clip_neg=False",  3.0,  False),
-        ("β=4, clip_neg=False", 4.0, False),
+        ("β=0, clip_neg=True",  0.0, True, None, None),
+        ("β=1, clip_neg=True",  1.0, True, None, None),
+        ("β=2, clip_neg=True",  2.0, True, None, None),
+        ("β=3, clip_neg=False", 3.0, False, None, None),
+        ("β=4, clip_neg=False", 4.0, False, None, None),
     ]
 
 test_images = []
-for label, beta_val, clip_val in configs:
+for label, beta_val, clip_val, top_frac_val, step_range_val in configs:
     print(f"  Generating: {label}...")
     img = steerer.generate(DIAG_PROMPT, DIAG_SEED, vectors=vectors,
-                           beta=beta_val, clip_negative=clip_val)
+                           beta=beta_val, clip_negative=clip_val,
+                           top_frac=top_frac_val, step_range=step_range_val)
     test_images.append((label, img))
 
 # --- Visual comparison ---
@@ -2053,6 +2151,8 @@ eval_results = evaluator.evaluate_unlearning(
     target_type=TARGET_TYPE,
     beta=BETA,
     clip_negative=CLIP_NEGATIVE,
+    top_frac=TOP_FRAC,
+    step_range=STEP_RANGE,
     eval_seeds=EVAL_SEEDS,
     save_images=True,
     output_dir=OUTPUT_DIR,
@@ -2269,6 +2369,8 @@ else:
             target_concept=style,
             target_type="style",
             beta=BETA,
+            top_frac=TOP_FRAC,
+            step_range=STEP_RANGE,
             eval_seeds=EVAL_SEEDS,
             save_images=True,
             generate_baselines=(style_idx == 0)  # baselines only for first style
