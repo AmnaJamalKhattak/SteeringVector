@@ -154,16 +154,118 @@ IMAGENET_CLASSES = [
     "macaw", "lorikeet", "coucal", "bee eater", "hornbill"
 ]
 
+# ============================================================================
+# WITHIN-CLASS SUB-CLASSES FOR OBJECT UNLEARNING
+# ----------------------------------------------------------------------------
+# Objects are intrinsically multi-dimensional in CLIP space (animal -> mammal
+# -> canine -> breed). To unlearn the CLASS, the diff matrix must span the
+# class's internal variation, otherwise SVD of (pos - neg) is rank-1 by
+# construction and removing it just slides generation along an unmodelled
+# within-class axis (golden retriever -> mongrel, same dog).
+#
+# Provide a curated list of sub-classes per object class. When the target
+# concept matches a key (case-insensitive, underscores stripped), positives
+# are sampled across the sub-classes; the diff matrix exposes the breed/
+# variant axes and SVD recovers the right rank automatically.
+#
+# Falls back to using the bare concept word for any class not listed here.
+# ============================================================================
+OBJECT_SUBCLASSES = {
+    "dog": [
+        "golden retriever", "poodle", "labrador", "chihuahua", "german shepherd",
+        "bulldog", "beagle", "husky", "border collie", "dalmatian",
+        "rottweiler", "boxer", "doberman", "great dane", "yorkshire terrier",
+        "shih tzu", "corgi", "pug", "schnauzer", "akita",
+    ],
+    "cat": [
+        "persian cat", "siamese cat", "maine coon", "tabby cat", "ragdoll cat",
+        "british shorthair", "sphynx cat", "bengal cat", "russian blue", "norwegian forest cat",
+        "abyssinian cat", "burmese cat", "scottish fold", "munchkin cat", "savannah cat",
+    ],
+    "bird": [
+        "robin", "eagle", "sparrow", "parrot", "owl",
+        "crow", "swan", "pelican", "flamingo", "hummingbird",
+        "falcon", "hawk", "pigeon", "duck", "seagull",
+    ],
+    "tree": [
+        "oak tree", "pine tree", "maple tree", "willow tree", "birch tree",
+        "redwood tree", "palm tree", "cedar tree", "elm tree", "spruce tree",
+        "cherry blossom tree", "fir tree", "magnolia tree", "sycamore tree", "olive tree",
+    ],
+    "car": [
+        "sedan", "convertible", "suv", "pickup truck", "sports car",
+        "minivan", "hatchback", "coupe", "limousine", "station wagon",
+        "race car", "vintage car", "electric car", "muscle car", "compact car",
+    ],
+    "horse": [
+        "stallion", "mare", "pony", "thoroughbred horse", "arabian horse",
+        "clydesdale horse", "appaloosa horse", "mustang horse", "shetland pony", "draft horse",
+        "quarter horse", "palomino horse", "morgan horse", "andalusian horse", "friesian horse",
+    ],
+    "fish": [
+        "goldfish", "tuna", "salmon", "trout", "bass fish",
+        "shark", "swordfish", "pike fish", "carp fish", "perch fish",
+        "marlin", "snapper", "catfish", "anchovy", "barracuda",
+    ],
+    "flower": [
+        "rose", "tulip", "daisy", "sunflower", "lily",
+        "orchid", "iris flower", "carnation", "peony", "daffodil",
+        "marigold", "hibiscus", "chrysanthemum", "lotus flower", "violet",
+    ],
+    "house": [
+        "bungalow", "cottage", "mansion", "townhouse", "log cabin",
+        "farmhouse", "victorian house", "ranch house", "tudor house", "colonial house",
+        "modern house", "stone house", "brick house", "wooden house", "thatched house",
+    ],
+    "tower": [
+        "clock tower", "bell tower", "watch tower", "lighthouse", "minaret",
+        "skyscraper", "water tower", "pagoda", "castle tower", "observation tower",
+        "stone tower", "cathedral tower", "radio tower", "windmill tower", "bell-shaped tower",
+    ],
+    "building": [
+        "skyscraper", "cathedral", "warehouse", "factory", "stadium",
+        "museum", "library", "hospital", "school building", "office building",
+        "apartment building", "city hall", "train station", "airport terminal", "shopping mall",
+    ],
+}
+
+
+def _subclasses_for(concept):
+    """Return list of sub-classes for `concept`, or [concept] if no entry.
+
+    Lookup is case-insensitive and ignores underscores so that runtime
+    identifiers like 'Dog' or 'Van_Gogh' work directly.
+    """
+    key = concept.lower().replace("_", " ").strip()
+    if key in OBJECT_SUBCLASSES:
+        return OBJECT_SUBCLASSES[key]
+    # Try singular/plural fallback (e.g. 'dogs' -> 'dog')
+    if key.endswith("s") and key[:-1] in OBJECT_SUBCLASSES:
+        return OBJECT_SUBCLASSES[key[:-1]]
+    return [concept]
+
+
 def make_object_prompts(concept, num_prompts=50):
     """
-    Generate diverse prompt pairs for OBJECT concept steering (CASteer-style).
+    Generate diverse prompt pairs for OBJECT concept steering.
 
-    Uses ImageNet classes as diverse base contexts:
-      Positive: "tench with Dog", "goldfish with Dog", ...
-      Negative: "tench", "goldfish", ...
+    For object unlearning, two axes of diversity matter:
+      1. Scene variation (which scene the object lives in)
+      2. Within-class variation (which sub-type of the object)
 
-    Averaging across many contexts ensures the contrastive vector isolates
-    the target object, not prompt-specific noise (layout, composition, etc.).
+    Without (2), the (pos - neg) diff matrix is rank-1 by construction and
+    SVD top-1 only captures the class centroid; generation then slides along
+    the unmodelled breed axis ("dog" -> different breed of dog). Sampling
+    sub-classes forces the diff matrix to expose internal variation so that
+    auto-rank SVD recovers the right number of directions to ablate.
+
+    For a concept registered in OBJECT_SUBCLASSES (dog, cat, tree, car, ...)
+    each pair becomes:
+        Positive: "{scene} with {subclass_i}"
+        Negative: "{scene}"
+
+    Sub-classes are cycled across `num_prompts` pairs. If the concept is not
+    in OBJECT_SUBCLASSES, falls back to the legacy "{scene} with {concept}".
 
     Args:
         concept: Object name (e.g., "Dog", "Cat")
@@ -173,9 +275,11 @@ def make_object_prompts(concept, num_prompts=50):
         List of (pos_prompt, neg_prompt) tuples
     """
     n = min(num_prompts, len(IMAGENET_CLASSES))
+    subs = _subclasses_for(concept)
     pairs = []
-    for cls in IMAGENET_CLASSES[:n]:
-        pairs.append((f"{cls} with {concept}", f"{cls}"))
+    for i, cls in enumerate(IMAGENET_CLASSES[:n]):
+        sub = subs[i % len(subs)]
+        pairs.append((f"{cls} with {sub}", f"{cls}"))
     return pairs
 
 def make_style_prompts(concept, num_prompts=50):
@@ -548,23 +652,62 @@ class FluxSteering:
     # LEARN: learn_vectors_diverse (MULTI-PROMPT)
     # ==================================================================
     @torch.no_grad()
-    def learn_vectors_diverse(self, prompt_pairs, seed=0, top_k=15, verbose=True):
+    def learn_vectors_diverse(self, prompt_pairs, seed=0, top_k=15, verbose=True,
+                              auto_rank=True, rank_floor_factor=1.0,
+                              max_rank=8, fixed_rank=None):
         """
         Learn steering vectors from DIVERSE prompt pairs (CASteer methodology).
 
         For each (pos_prompt, neg_prompt) pair:
           1. Get activations for pos_prompt, neg_prompt
-          2. Accumulate: diff += activation(pos) - activation(neg)
-        Final vector = mean(diffs) / ||mean(diffs)||
+          2. Accumulate the per-pair (pos - neg) into a stacked diff matrix S.
 
-        The diverse contexts cancel out, leaving only the concept-specific direction.
+        Aggregation across pairs (pincer_v2 only):
+          - auto_rank=True (default): SVD of S, with rank chosen by a
+            null-model ceiling. Build N from the negatives alone
+            (clip(neg_i) - clip(neg_j)); σ_1(N) is the maximum spectral
+            mass that scene/prompt-template variance alone can produce.
+            Keep components of S whose σ_i > rank_floor_factor * σ_1(N).
+            This generalises across concepts: styles collapse to k=1,
+            multi-dimensional objects expand to whatever rank they need.
+          - auto_rank=False: legacy mean-of-diffs (rank-1 always).
+          - fixed_rank: if set (int), overrides auto_rank and keeps the
+            top `fixed_rank` SVD components.
 
-        pincer_v2 mode: computes CLIP (768-d) and T5 (4096-d) directions
-        DIRECTLY from `_get_clip_prompt_embeds` and `_get_t5_prompt_embeds`
-        — no pipeline runs, so learning is orders of magnitude faster.
+        Sign of each retained SVD component is aligned with the mean diff
+        so that subtraction removes the concept (pos -> neg direction).
+
+        Each retained component is returned under a unique key:
+          "clip_768"   -> rank 0  (single-component / legacy)
+          "clip_768_0" -> rank 0
+          "clip_768_1" -> rank 1
+          ...
+          "t5_4096"    -> rank 0  (single-component / legacy)
+          "t5_4096_0", "t5_4096_1", ...
+
+        At apply time each numbered key registers its own pre-hook on the
+        appropriate text entry point, so the steering subtracts the
+        projection onto the entire retained subspace (orthogonal components
+        compose cleanly).
+
+        pincer_v2 mode: computes CLIP and T5 directions DIRECTLY from
+        `_get_clip_prompt_embeds` and `_get_t5_prompt_embeds` — no pipeline
+        runs, so learning is orders of magnitude faster.
 
         hybrid mode: unchanged — runs the pipeline with hooks on
         context_embedder + time_text_embed + add_k_proj + add_q_proj.
+
+        Args:
+            prompt_pairs: list of (pos_prompt, neg_prompt) tuples.
+            seed: seed used by the (legacy) hybrid pipeline pass.
+            top_k: ignored in pincer_v2; kept for API compatibility.
+            verbose: print progress and spectra.
+            auto_rank: enable null-model auto-rank (recommended).
+            rank_floor_factor: scale on the null-model ceiling. >1 is
+                more conservative (keep fewer components); <1 keeps more.
+            max_rank: hard cap on retained components per path (safety).
+            fixed_rank: if not None, keep this many components regardless
+                of the null model.
         """
         n_pairs = len(prompt_pairs)
         if verbose:
@@ -575,8 +718,11 @@ class FluxSteering:
         # pincer_v2: direct-embedding path (no pipeline runs)
         # ------------------------------------------------------------------
         if self.mode == "pincer_v2":
-            clip_diff_accum = None
-            t5_diff_accum = None
+            clip_diffs = []
+            t5_diffs = []
+            neg_clip_embeds = []
+            neg_t5_embeds = []
+
             for pair_idx, (pos_prompt, neg_prompt) in enumerate(
                 tqdm(prompt_pairs, desc="Diverse pairs (CLIP+T5 direct)", disable=not verbose)
             ):
@@ -592,37 +738,132 @@ class FluxSteering:
                 # T5 (per-token 4096-d → mask-aware mean pool)
                 t5_pos, pos_mask = self._get_t5_embeddings_and_mask(pos_prompt)
                 t5_neg, neg_mask = self._get_t5_embeddings_and_mask(neg_prompt)
-                d_t5 = self._masked_mean(t5_pos, pos_mask) - self._masked_mean(t5_neg, neg_mask)
+                t5_pos_pool = self._masked_mean(t5_pos, pos_mask)
+                t5_neg_pool = self._masked_mean(t5_neg, neg_mask)
+                d_t5 = t5_pos_pool - t5_neg_pool
 
-                clip_diff_accum = d_clip if clip_diff_accum is None else clip_diff_accum + d_clip
-                t5_diff_accum = d_t5 if t5_diff_accum is None else t5_diff_accum + d_t5
+                clip_diffs.append(d_clip)
+                t5_diffs.append(d_t5)
+                # Cache neg embeddings for the null model (no concept).
+                neg_clip_embeds.append(clip_neg)
+                neg_t5_embeds.append(t5_neg_pool)
 
                 if verbose and (pair_idx + 1) % 10 == 0:
                     print(f"  Completed {pair_idx + 1}/{n_pairs} prompt pairs")
 
-            clip_avg = clip_diff_accum / n_pairs
-            t5_avg = t5_diff_accum / n_pairs
-            clip_strength = float(clip_avg.norm())
-            t5_strength = float(t5_avg.norm())
-            clip_direction = clip_avg / (clip_avg.norm() + 1e-8)
-            t5_direction = t5_avg / (t5_avg.norm() + 1e-8)
+            # ----- Signal stack: shape (n_pairs, dim) -----
+            clip_S = torch.stack(clip_diffs, dim=0)
+            t5_S = torch.stack(t5_diffs, dim=0)
+
+            # ----- Null model: pure scene/template variance -----
+            # neg(i) - neg(j) for cyclic i,j shares no concept; its top
+            # singular value is the largest direction that prompt-template
+            # variance can produce on its own. Any S component below this
+            # is statistically indistinguishable from scene noise.
+            if n_pairs >= 2:
+                neg_clip_stack = torch.stack(neg_clip_embeds, dim=0)
+                neg_t5_stack = torch.stack(neg_t5_embeds, dim=0)
+                clip_N = neg_clip_stack - neg_clip_stack.roll(shifts=1, dims=0)
+                t5_N = neg_t5_stack - neg_t5_stack.roll(shifts=1, dims=0)
+            else:
+                clip_N = torch.zeros_like(clip_S)
+                t5_N = torch.zeros_like(t5_S)
+
+            # ----- SVD on signal and null -----
+            _, clip_sig_S, clip_sig_Vh = torch.linalg.svd(clip_S, full_matrices=False)
+            _, t5_sig_S, t5_sig_Vh = torch.linalg.svd(t5_S, full_matrices=False)
+            _, clip_null_S, _ = torch.linalg.svd(clip_N, full_matrices=False)
+            _, t5_null_S, _ = torch.linalg.svd(t5_N, full_matrices=False)
+
+            clip_ceiling = float(clip_null_S[0]) if clip_null_S.numel() > 0 else 0.0
+            t5_ceiling = float(t5_null_S[0]) if t5_null_S.numel() > 0 else 0.0
+
+            # ----- Choose rank -----
+            if fixed_rank is not None:
+                k_clip = max(1, min(int(fixed_rank), int(clip_sig_S.numel()), max_rank))
+                k_t5 = max(1, min(int(fixed_rank), int(t5_sig_S.numel()), max_rank))
+                rank_label = f"fixed_rank={fixed_rank}"
+            elif auto_rank and n_pairs >= 2:
+                clip_thresh = rank_floor_factor * clip_ceiling
+                t5_thresh = rank_floor_factor * t5_ceiling
+                k_clip = int((clip_sig_S > clip_thresh).sum().item())
+                k_t5 = int((t5_sig_S > t5_thresh).sum().item())
+                k_clip = max(1, min(k_clip, max_rank))
+                k_t5 = max(1, min(k_t5, max_rank))
+                rank_label = (
+                    f"auto-rank (factor={rank_floor_factor}, "
+                    f"clip_ceil={clip_ceiling:.4f}, t5_ceil={t5_ceiling:.4f})"
+                )
+            else:
+                # Legacy path: rank-1 mean of diffs.
+                clip_avg = clip_S.mean(dim=0)
+                t5_avg = t5_S.mean(dim=0)
+                clip_strength = float(clip_avg.norm())
+                t5_strength = float(t5_avg.norm())
+                clip_direction = clip_avg / (clip_avg.norm() + 1e-8)
+                t5_direction = t5_avg / (t5_avg.norm() + 1e-8)
+
+                if verbose:
+                    print(f"\n{'='*70}")
+                    print(f"Diverse-Prompt Steering Vectors (pincer_v2, {n_pairs} pairs, mean-of-diffs)")
+                    print(f"{'='*70}")
+                    print(f"{'Layer':<25} {'Step':<6} {'Strength':<12}")
+                    print(f"{'-'*70}")
+                    print(f"{'clip_768':<25} {'0':<6} {clip_strength:<12.4f}")
+                    print(f"{'t5_4096':<25} {'0':<6} {t5_strength:<12.4f}")
+                    print(f"{'-'*70}")
+                    print(f"Total vectors: 2 (clip_768 + t5_4096)")
+                    print(f"{'='*70}\n")
+
+                return {
+                    "clip_768": {0: clip_direction},
+                    "t5_4096": {0: t5_direction},
+                }
+
+            # ----- Sign-align with mean diff (pos -> neg) -----
+            clip_mean = clip_S.mean(dim=0)
+            t5_mean = t5_S.mean(dim=0)
+
+            result = {}
+
+            # CLIP retained components
+            for i in range(k_clip):
+                pc = clip_sig_Vh[i]
+                if torch.dot(pc, clip_mean) < 0:
+                    pc = -pc
+                pc = pc / (pc.norm() + 1e-8)
+                result[f"clip_768_{i}"] = {0: pc}
+
+            # T5 retained components
+            for i in range(k_t5):
+                pc = t5_sig_Vh[i]
+                if torch.dot(pc, t5_mean) < 0:
+                    pc = -pc
+                pc = pc / (pc.norm() + 1e-8)
+                result[f"t5_4096_{i}"] = {0: pc}
 
             if verbose:
                 print(f"\n{'='*70}")
-                print(f"Diverse-Prompt Steering Vectors (pincer_v2, {n_pairs} pairs)")
+                print(f"Diverse-Prompt Steering Vectors (pincer_v2, {n_pairs} pairs, {rank_label})")
                 print(f"{'='*70}")
+                print(f"CLIP spectrum (top 10): " +
+                      ", ".join(f"{float(s):.3f}" for s in clip_sig_S[:10]))
+                print(f"T5   spectrum (top 10): " +
+                      ", ".join(f"{float(s):.3f}" for s in t5_sig_S[:10]))
+                print(f"CLIP null ceiling: {clip_ceiling:.4f}  ->  k_clip = {k_clip}")
+                print(f"T5   null ceiling: {t5_ceiling:.4f}  ->  k_t5   = {k_t5}")
+                print(f"{'-'*70}")
                 print(f"{'Layer':<25} {'Step':<6} {'Strength':<12}")
                 print(f"{'-'*70}")
-                print(f"{'clip_768':<25} {'0':<6} {clip_strength:<12.4f}")
-                print(f"{'t5_4096':<25} {'0':<6} {t5_strength:<12.4f}")
+                for i in range(k_clip):
+                    print(f"{f'clip_768_{i}':<25} {'0':<6} {float(clip_sig_S[i]):<12.4f}")
+                for i in range(k_t5):
+                    print(f"{f't5_4096_{i}':<25} {'0':<6} {float(t5_sig_S[i]):<12.4f}")
                 print(f"{'-'*70}")
-                print(f"Total vectors: 2 (clip_768 + t5_4096)")
+                print(f"Total vectors: {k_clip + k_t5} ({k_clip} CLIP + {k_t5} T5)")
                 print(f"{'='*70}\n")
 
-            return {
-                "clip_768": {0: clip_direction},
-                "t5_4096": {0: t5_direction},
-            }
+            return result
 
         # ------------------------------------------------------------------
         # hybrid: legacy pipeline-with-hooks path (unchanged)
@@ -789,8 +1030,13 @@ class FluxSteering:
         Context manager to apply steering vectors during generation.
 
         Hook points (pincer_v2 / EPO):
-          - "clip_768"  -> PRE-hook on time_text_embed input (768-d, pre-SiLU).
-          - "t5_4096"   -> PRE-hook on context_embedder input (4096-d, pre-AdaLN).
+          - "clip_768"      -> PRE-hook on time_text_embed input (768-d, pre-SiLU).
+          - "clip_768_<i>"  -> PRE-hook (rank-k subspace removal). One pre-hook
+                               per retained SVD component; PyTorch fires them
+                               in registration order so they compose into a
+                               single subspace projection-removal.
+          - "t5_4096"       -> PRE-hook on context_embedder input (4096-d, pre-AdaLN).
+          - "t5_4096_<i>"   -> PRE-hook (rank-k subspace removal on T5).
         Hook points (hybrid + legacy):
           - "context_embedder", "time_text_embed": output hooks.
           - "add_k_<i>", "add_q_<i>": output hooks on text-side K/Q projections.
@@ -902,14 +1148,22 @@ class FluxSteering:
             for li, step_vecs in vectors.items():
                 li_str = str(li)
 
-                if li_str == "clip_768":
+                # CLIP subspace: legacy single key "clip_768" or rank-k
+                # numbered keys "clip_768_0", "clip_768_1", ... — each
+                # registers its own pre-hook on time_text_embed input.
+                # PyTorch fires pre-hooks in registration order, so they
+                # compose; with orthogonal SVD components this is
+                # equivalent to subspace projection-removal in one shot.
+                if li_str == "clip_768" or li_str.startswith("clip_768_"):
                     self._handles.append(
                         self.target_layers["time_text_embed"].register_forward_pre_hook(
                             clip_pre_hook(step_vecs[0], beta_clip)
                         )
                     )
 
-                elif li_str == "t5_4096":
+                # T5 subspace: legacy "t5_4096" or numbered "t5_4096_0",
+                # "t5_4096_1", ... — same logic on context_embedder input.
+                elif li_str == "t5_4096" or li_str.startswith("t5_4096_"):
                     self._handles.append(
                         self.target_layers["context_embedder"].register_forward_pre_hook(
                             t5_pre_hook(step_vecs[0], beta_t5)
