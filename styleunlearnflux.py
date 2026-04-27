@@ -1168,7 +1168,7 @@ class FluxSteering:
     # ==================================================================
     @contextmanager
     def apply_vectors(self, vectors, beta=2.0, clip_negative=True,
-                      top_frac=None, step_range=None):
+                      top_frac=None, step_range=None, clip_cap=1.0):
         """
         Context manager to apply steering vectors during generation.
 
@@ -1197,6 +1197,13 @@ class FluxSteering:
             step_range: (start, end) tuple; steering fires only when
                 start <= step < end. Indices are 0-based denoising step
                 indices. None means "every step" (legacy behaviour).
+            clip_cap: ceiling on the *effective* CLIP β (default 1.0 — the
+                original style guardrail that stops β·score from exceeding
+                the projection's own magnitude). Set to None to disable
+                the cap entirely (required for OBJECT unlearning, where
+                the dog lives in a multi-D pooled-CLIP subspace and we
+                need β_clip > 1 to push past zero into anti-concept space).
+                Confined to the CLIP path; T5 ablation is unaffected.
         """
         # Parse per-component beta
         if isinstance(beta, dict):
@@ -1250,8 +1257,18 @@ class FluxSteering:
 
         def clip_pre_hook(direction, b_clip):
             """PRE-hook on time_text_embed. `pooled_projections` is the last
-            positional arg. Cap score at its own magnitude so β_clip > 1
-            cannot over-remove past the concept-free point."""
+            positional arg.
+
+            Cap behaviour: the effective β is `min(b_clip, clip_cap)` per
+            outer-scope `clip_cap`. Default cap=1.0 keeps the historical
+            style guardrail (β·score ≤ projection magnitude → cannot
+            over-remove past the concept-free point). For OBJECT mode,
+            pass clip_cap=None: this disables the cap so β_clip > 1
+            pushes the projection past zero into anti-concept space,
+            which is required because the object's pooled-CLIP signature
+            is multi-dimensional and zeroing one axis just slides
+            generation to a neighbouring breed.
+            """
             def hook(module, args):
                 step = self._current_step + 1
                 if not _in_range(step):
@@ -1261,7 +1278,10 @@ class FluxSteering:
                 score = (pooled @ d)
                 if clip_negative:
                     score = score.clamp(min=0.0)
-                effective = min(float(b_clip), 1.0) * score
+                if clip_cap is None:
+                    effective = float(b_clip) * score
+                else:
+                    effective = min(float(b_clip), float(clip_cap)) * score
                 update = effective.unsqueeze(-1) * d
                 return args[:-1] + (pooled - update,)
             return hook
@@ -1370,7 +1390,7 @@ class FluxSteering:
     # GENERATE
     # ==================================================================
     def generate(self, prompt, seed, vectors=None, beta=2.0, clip_negative=True,
-                 top_frac=None, step_range=None):
+                 top_frac=None, step_range=None, clip_cap=1.0):
         """Generate image with optional steering.
 
         Args:
@@ -1386,12 +1406,20 @@ class FluxSteering:
                       Objects use ~0.15 to localize to concept tokens.
                       Style uses 1.0 (no gating, style is diffuse).
             step_range: Tuple (start, end) of denoising steps to steer.
-                        Objects use (0, 2) — identity is committed early.
+                        Objects use (0, N_STEPS) — full coverage so β_clip
+                        can ablate cleanly across the whole trajectory.
                         Style uses (0, N_STEPS) — style is painted throughout.
+            clip_cap: ceiling on the effective CLIP β (default 1.0).
+                      STYLE: keep at 1.0 (β_clip=0 in style configs anyway).
+                      OBJECT: pass None to uncap — required because the
+                      pooled-CLIP signature of an object is multi-D and
+                      capped β=1 only zeroes one axis (yields a different
+                      breed, not a removed dog).
         """
         if vectors:
             with self.apply_vectors(vectors, beta=beta, clip_negative=clip_negative,
-                                    top_frac=top_frac, step_range=step_range):
+                                    top_frac=top_frac, step_range=step_range,
+                                    clip_cap=clip_cap):
                 return self._run_pipe_base(prompt, seed)
         else:
             return self._run_pipe_base(prompt, seed)
@@ -1953,6 +1981,7 @@ class UnlearnCanvasEvaluator:
         clip_negative=True,
         top_frac=None,
         step_range=None,
+        clip_cap=1.0,
         eval_seeds=None,
         save_images=True,
         output_dir=None,
@@ -2025,6 +2054,7 @@ class UnlearnCanvasEvaluator:
                 clip_negative=clip_negative,
                 top_frac=top_frac,
                 step_range=step_range,
+                clip_cap=clip_cap,
             )
             img.save(save_path)
             generated += 1
@@ -2219,11 +2249,16 @@ print("✓ FLUX pipeline loaded")
 TARGET_CONCEPT = "Dog"        # Concept to unlearn (e.g., "Dog", "Van_Gogh")
 TARGET_TYPE = "object"        # "style" or "object"
 
-# Auto-pick the right mode for the target type.
-if TARGET_TYPE == "object":
-    STEERING_MODE = "pincer_perstep"
-else:
-    STEERING_MODE = "pincer_v2"
+# Both target types now use pincer_v2 (2 vectors total: 1 CLIP + 1 T5,
+# both subtracted via PRE-hooks at the text entry points). Object vs
+# style differ only at apply-time:
+#   - STYLE  : β_clip=0, β_t5=2, top_frac=1.0, clip_cap=1.0
+#   - OBJECT : β_clip=3, β_t5=4, top_frac=0.15, clip_cap=None (uncapped)
+# pincer_perstep (5 vectors) is retained as an escape hatch but is
+# heavier and bleeds into non-object content — pincer_v2 with the
+# uncapped CLIP path matches what objectunlearnflux.py achieved with
+# 5 vectors at the cost of just 2.
+STEERING_MODE = "pincer_v2"
 print(f"\nInitializing FluxSteering (mode={STEERING_MODE})...")
 steerer = FluxSteering(pipe, device=DEVICE, n_steps=N_STEPS, mode=STEERING_MODE)
 
@@ -2269,19 +2304,37 @@ Change TARGET_CONCEPT and TARGET_TYPE for different experiments.
 if TARGET_TYPE == "style":
     # pincer_v2 (2 vectors): style is rank-1 + diffuse across all tokens
     # and all steps. CLIP=0 because style is not in pooled CLIP for FLUX
-    # (per the diagnostic at the top of this file).
+    # (per the diagnostic at the top of this file). CLIP_CAP=1.0 is the
+    # historical guardrail; harmless here because beta_clip=0.
     BETA = {"clip": 0.0, "t5": 2.0}
     TOP_FRAC = 1.0
     STEP_RANGE = (0, N_STEPS)
+    CLIP_CAP = 1.0
 else:
-    # pincer_perstep (n_steps + 1 vectors): per-step T5 captures the
-    # timestep-specific concept signature; top_frac=0.15 localises
-    # subtraction to the actual concept tokens (leaving scene tokens
-    # alone); step_range=(0, 2) limits cumulative ablation to the
-    # early steps where object identity is committed.
-    BETA = {"clip": 1.0, "t5": 4.0}
+    # pincer_v2 (2 vectors) for OBJECT: same architecture as style — 1
+    # CLIP direction at time_text_embed input + 1 T5 direction at
+    # context_embedder input — but the apply knobs differ:
+    #
+    # * BETA["clip"] = 3.0 + CLIP_CAP = None: the dog's pooled-CLIP
+    #   signature is multi-dimensional. Capping at 1.0 only zeroes the
+    #   projection on one axis, which yields a different breed (image
+    #   sweeps confirmed this). Uncapped β=3 pushes past zero into
+    #   anti-concept space along that axis, which (combined with the
+    #   downstream AdaLN that propagates CLIP modulation through every
+    #   block) is enough to break the dog identity. This matches the
+    #   working settings in objectunlearnflux.py.
+    # * BETA["t5"] = 4.0 + TOP_FRAC = 0.15: T5 itself is not the lever
+    #   for object identity (per the diagnostic), but mild ablation
+    #   restricted to the top-15% of tokens by alignment score
+    #   localises any T5 contribution to the actual concept tokens —
+    #   so the steering is as localised as a 1-vector pooled CLIP path
+    #   permits while still covering the joint-attention pathway.
+    # * STEP_RANGE = (0, N_STEPS): fire on every denoising step.
+    #   Anything narrower silently disables half the ablation.
+    BETA = {"clip": 3.0, "t5": 4.0}
     TOP_FRAC = 0.15
-    STEP_RANGE = (0, 2)
+    STEP_RANGE = (0, N_STEPS)
+    CLIP_CAP = None
 
 # ==========================================================================
 # Automatic configuration
@@ -2318,9 +2371,9 @@ if TARGET_TYPE == "object":
     print(f"  Example pos:     '{DIVERSE_PROMPT_PAIRS[0][0]}'")
     print(f"  Example neg:     '{DIVERSE_PROMPT_PAIRS[0][1]}'")
     print(f"  Rationale:       Averaging across 50 contexts cancels non-concept info,")
-    print(f"                   isolating the target direction. Top-k gate + early-step")
-    print(f"                   gating localize removal to concept tokens in steps 0-1.")
-    print(f"  EPO approach:    Pre-hook on time_text_embed (CLIP-768) capped at 1.0;")
+    print(f"                   isolating the target direction. Top-k gate localises T5")
+    print(f"                   removal to concept tokens.")
+    print(f"  EPO approach:    Pre-hook on time_text_embed (CLIP-768), clip_cap={CLIP_CAP};")
     print(f"                   pre-hook on context_embedder (T5-4096) with top-k gate.")
     print(f"                   clip={BETA.get('clip', 'N/A')}, t5={BETA.get('t5', 'N/A')}")
 else:
@@ -2491,7 +2544,8 @@ for label, beta_val, clip_val, top_frac_val, step_range_val in configs:
     print(f"  Generating: {label}...")
     img = steerer.generate(DIAG_PROMPT, DIAG_SEED, vectors=vectors,
                            beta=beta_val, clip_negative=clip_val,
-                           top_frac=top_frac_val, step_range=step_range_val)
+                           top_frac=top_frac_val, step_range=step_range_val,
+                           clip_cap=CLIP_CAP)
     test_images.append((label, img))
 
 # --- Visual comparison ---
@@ -2607,6 +2661,7 @@ eval_results = evaluator.evaluate_unlearning(
     clip_negative=CLIP_NEGATIVE,
     top_frac=TOP_FRAC,
     step_range=STEP_RANGE,
+    clip_cap=CLIP_CAP,
     eval_seeds=EVAL_SEEDS,
     save_images=True,
     output_dir=OUTPUT_DIR,
@@ -2825,6 +2880,7 @@ else:
             beta=BETA,
             top_frac=TOP_FRAC,
             step_range=STEP_RANGE,
+            clip_cap=CLIP_CAP,
             eval_seeds=EVAL_SEEDS,
             save_images=True,
             generate_baselines=(style_idx == 0)  # baselines only for first style
