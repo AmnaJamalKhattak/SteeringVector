@@ -393,7 +393,7 @@ class FluxSteering:
       "pincer_v2" -- object unlearning (Entry-Point-Only: CLIP + T5, no image patches)
     """
 
-    VALID_MODES = ("hybrid", "pincer_v2")
+    VALID_MODES = ("hybrid", "pincer_v2", "pincer_perstep")
 
     def __init__(self, pipe, device="cuda", n_steps=4, mode="hybrid"):
         self.pipe = pipe
@@ -456,9 +456,25 @@ class FluxSteering:
                 f"    (raw T5 hidden states, before Linear + downstream AdaLayerNormZero)\n"
                 f"  - CLIP score capped at min(beta_clip, 1.0) to prevent over-removal\n"
                 f"  - T5 hook supports top-k token gating (top_frac) + step gating (step_range)\n"
-                f"  - Object: top_frac=0.15, step_range=(0,2), beta={{'clip':1, 't5':4}}\n"
                 f"  - Style : top_frac=1.0,  step_range=(0,{self.n_steps}), beta={{'clip':0, 't5':2}}\n"
+                f"  - Recommended for STYLE unlearning (style is rank-1 + diffuse)\n"
                 f"  - No image patches hooked (avoids background entanglement)"
+            ),
+            "pincer_perstep": (
+                f"  - Per-step EPO steering (object unlearning):\n"
+                f"  - CLIP direction (768-d) -> pre-hook on time_text_embed INPUT (before SiLU)\n"
+                f"  - T5 directions ({self.n_steps} x 3072-d) -> output hook on context_embedder\n"
+                f"    one direction per denoising step, captured in the operative space\n"
+                f"    (post-projection 3072-d, the actual joint-stream input).\n"
+                f"  - CLIP score capped at min(beta_clip, 1.0)\n"
+                f"  - T5 hook supports top-k token gating (top_frac) for token localisation\n"
+                f"    + step gating (step_range) — both reuse styleunlearnflux's existing\n"
+                f"    output_hook(token_gate=True) infrastructure on the context_embedder key.\n"
+                f"  - Object: top_frac=0.15, step_range=(0,2), beta={{'clip':1, 't5':4}}\n"
+                f"  - Recommended for OBJECT unlearning. Uses single pos/neg prompt with N\n"
+                f"    seeds (NOT diverse-prompt CASteer); per-step capture tracks the\n"
+                f"    timestep-specific operating point of the joint-stream representation.\n"
+                f"  - Total: {self.n_steps} + 1 vectors (context_embedder per-step + clip_768)"
             ),
         }
         print(f"FluxSteering initialized (mode={mode}):")
@@ -537,6 +553,8 @@ class FluxSteering:
             return self._learn_hybrid(pos_prompt, neg_prompt, seeds, verbose)
         elif self.mode == "pincer_v2":
             return self._learn_pincer_v2(pos_prompt, neg_prompt, seeds, verbose)
+        elif self.mode == "pincer_perstep":
+            return self._learn_pincer_perstep(pos_prompt, neg_prompt, seeds, verbose)
 
     # ==================================================================
     # LEARN: hybrid (TRACE entry points + CASteer add_k/add_q)
@@ -647,6 +665,131 @@ class FluxSteering:
             "clip_768": {0: clip_direction},
             "t5_4096": {0: t5_direction},
         }
+
+    # ==================================================================
+    # LEARN: pincer_perstep (per-step T5 -- object unlearning)
+    # ------------------------------------------------------------------
+    # This is the working 5-vector recipe from objectunlearnflux, ported
+    # so we can layer styleunlearnflux's localisation knobs (top_frac
+    # token gating + step_range) on top of it via apply_vectors.
+    #
+    # Why this design (vs. pincer_v2's direct-encoder T5):
+    #   * Object identity is committed across multiple denoising steps,
+    #     and the joint stream's operative T5 representation evolves with
+    #     the timestep. A single time-invariant direction (pincer_v2)
+    #     misses the trajectory; per-step directions track the actual
+    #     operating point at each step.
+    #   * The post-projection 3072-d output of context_embedder is the
+    #     space the joint attention actually consumes — that is where
+    #     the timestep-specific concept signature lives.
+    #   * Single (pos, neg) prompt × N seeds gives a clean concept
+    #     signature: noise variance averages across seeds, the concept
+    #     direction adds coherently. Diverse-prompt CASteer averaging is
+    #     unnecessary when the anchor prompts are already strong.
+    #
+    # Vectors returned:
+    #   "clip_768"        : {0: direction}                  # 1 vector
+    #   "context_embedder": {0: v0, 1: v1, ..., n_steps-1: v_{n-1}}
+    #                                                       # n_steps vectors
+    # Total: n_steps + 1 vectors.
+    #
+    # apply_vectors handles "context_embedder" via the legacy output-hook
+    # path with token_gate=True, so passing top_frac (e.g. 0.15) into
+    # generate() will localise per-token subtraction to the top-k tokens
+    # — i.e. the actual concept tokens — leaving scene tokens untouched.
+    # That is precisely the localisation that the original 5-vector
+    # method lacked, which produced the "things other than the object
+    # got steered slightly" side-effect.
+    # ==================================================================
+    def _learn_pincer_perstep(self, pos_prompt, neg_prompt, seeds, verbose):
+        """
+        Per-step EPO learning for object unlearning.
+
+        CLIP path: direct pooled embedding from `_get_clip_prompt_embeds`.
+          One direction at step 0, applied at every denoising step via
+          pre-hook on `time_text_embed` input (capped at min(b_clip, 1)).
+
+        T5 path: forward hook on `context_embedder` OUTPUT (3072-d).
+          For each (pos, neg) seed pair, the masked-mean of the per-token
+          activation is accumulated as `+pos_act` then `-neg_act`. Across
+          N seeds the per-step mean-of-diffs converges on the
+          timestep-specific concept signature in the operative space.
+
+        Returns:
+            {"clip_768": {0: clip_direction},
+             "context_embedder": {step: dir for step in 0..n_steps-1}}
+        """
+        if verbose:
+            print(f"Per-step EPO learning: CLIP 768-d (direct) + "
+                  f"T5 context_embedder 3072-d (per-step hook over {len(seeds)} seeds)")
+
+        # --- CLIP: direct pooled embedding ---
+        clip_pos = self.pipe._get_clip_prompt_embeds(
+            prompt=pos_prompt, device=self.device
+        ).squeeze(0).float()  # (768,)
+        clip_neg = self.pipe._get_clip_prompt_embeds(
+            prompt=neg_prompt, device=self.device
+        ).squeeze(0).float()
+        clip_diff = clip_pos - clip_neg
+        clip_strength = float(clip_diff.norm())
+        clip_direction = clip_diff / (clip_diff.norm() + 1e-8)
+
+        # --- T5 / context_embedder: pipeline runs with per-step hook ---
+        pos_mask, pos_n = self._get_t5_mask(pos_prompt)
+        neg_mask, neg_n = self._get_t5_mask(neg_prompt)
+        if verbose:
+            print(f"T5 mask: pos has {pos_n} real tokens, neg has {neg_n} real tokens "
+                  f"(out of {pos_mask.shape[1]})")
+
+        mean_diffs = defaultdict(lambda: defaultdict(float))
+        counts = defaultdict(lambda: defaultdict(int))
+
+        def hook_fn(layer_name, sign):
+            def hook(module, inputs, output):
+                step = self._current_step + 1
+                if 0 <= step < self.n_steps:
+                    act = output.detach().float()
+                    if act.dim() == 3:
+                        mean_act = self._masked_mean(act, self._current_attention_mask)
+                    else:
+                        mean_act = act.mean(dim=tuple(range(act.dim() - 1)))
+                    mean_diffs[layer_name][step] += (sign * mean_act)
+                    counts[layer_name][step] += 1
+                return output
+            return hook
+
+        ctx_mod = self.target_layers["context_embedder"]
+
+        def _run_pass(prompt, mask, sign, desc):
+            self._current_attention_mask = mask
+            for seed in tqdm(seeds, desc=desc, disable=not verbose):
+                self._clear_hooks()
+                self._handles.append(
+                    ctx_mod.register_forward_hook(hook_fn("context_embedder", sign))
+                )
+                self._run_pipe_base(prompt, seed)
+
+        try:
+            _run_pass(pos_prompt, pos_mask, +1, "Per-step learning (+)")
+            _run_pass(neg_prompt, neg_mask, -1, "Per-step learning (-)")
+        finally:
+            self._clear_hooks()
+            self._current_attention_mask = None
+
+        # --- Build per-step T5 vectors (mean-of-diffs across seeds) ---
+        vectors = dict(self._build_vectors_keep_all(
+            mean_diffs, counts, len(seeds), verbose,
+            title="Per-Step Steering Vectors -- T5 / context_embedder"
+        ))
+
+        # --- Add CLIP direction under "clip_768", step 0 ---
+        vectors["clip_768"] = {0: clip_direction}
+        if verbose:
+            print(f"{'clip_768':<25} {'0':<6} {clip_strength:<12.4f}")
+            total = sum(len(v) for v in vectors.values())
+            print(f"Total vectors (incl. clip_768): {total}")
+
+        return vectors
 
     # ==================================================================
     # LEARN: learn_vectors_diverse (MULTI-PROMPT)
@@ -1171,8 +1314,15 @@ class FluxSteering:
                     )
 
                 elif li_str == "context_embedder":
-                    # Legacy: T5 output hook in 3072-d. Kept for old saved
-                    # vectors. Prefer "t5_4096" pre-hook for new runs.
+                    # Per-step T5 output hook in 3072-d (post-projection).
+                    # CANONICAL path for pincer_perstep mode (object
+                    # unlearning): step_vecs is {0:v0, ..., n_steps-1:v_n}
+                    # so output_hook fires the timestep-matched direction
+                    # at each step. token_gate=True enables top_frac
+                    # localisation so subtraction concentrates on the
+                    # actual concept tokens (not scene tokens). step_range
+                    # is enforced in output_hook via _in_range(step).
+                    # Also retained for any legacy hybrid saved vectors.
                     self._handles.append(
                         self.target_layers["context_embedder"].register_forward_hook(
                             output_hook(step_vecs, beta_t5, token_gate=True)
@@ -2050,11 +2200,30 @@ print("✓ FLUX pipeline loaded")
 
 # Initialize FluxSteering
 # Available modes (pick ONE):
-#   "hybrid"     -> entry points + add_k/add_q (STYLE unlearning)
-#   "pincer_v2"  -> CLIP + add_k/add_q with per-component beta (OBJECT unlearning)
-#                   Use beta={"clip": 3.0, "attn": 12.0} for independent control
-STEERING_MODE = "pincer_v2"  # EPO-style steering for BOTH objects and style
-                             # (hybrid retained only for backward compat with old vectors)
+#   "hybrid"          -> TRACE entry points + add_k/add_q (legacy, kept for
+#                        backward compat with saved vectors)
+#   "pincer_v2"       -> 2-vector EPO. Direct-encoder CLIP + direct-encoder T5,
+#                        applied as PRE-hooks. Best for STYLE (rank-1, diffuse).
+#   "pincer_perstep"  -> per-step EPO. Direct-encoder CLIP + per-step T5 from
+#                        context_embedder OUTPUT hook (post-projection 3072-d).
+#                        Best for OBJECT (identity tracked across denoising
+#                        trajectory). Apply with top_frac + step_range to
+#                        localise removal to concept tokens at the steps where
+#                        identity is committed.
+#
+# Target selection — defined here (not in the experiment-config cell below) so
+# that STEERING_MODE can auto-pick based on TARGET_TYPE before we instantiate
+# the steerer. The full experiment block lower down still owns BETA/TOP_FRAC
+# /STEP_RANGE; the TARGET_CONCEPT/TARGET_TYPE values below are the canonical
+# ones and are not redefined later.
+TARGET_CONCEPT = "Dog"        # Concept to unlearn (e.g., "Dog", "Van_Gogh")
+TARGET_TYPE = "object"        # "style" or "object"
+
+# Auto-pick the right mode for the target type.
+if TARGET_TYPE == "object":
+    STEERING_MODE = "pincer_perstep"
+else:
+    STEERING_MODE = "pincer_v2"
 print(f"\nInitializing FluxSteering (mode={STEERING_MODE})...")
 steerer = FluxSteering(pipe, device=DEVICE, n_steps=N_STEPS, mode=STEERING_MODE)
 
@@ -2078,11 +2247,12 @@ Change TARGET_CONCEPT and TARGET_TYPE for different experiments.
 # ==========================================================================
 # EXPERIMENT CONFIGURATION - MODIFY THESE
 # ==========================================================================
-TARGET_CONCEPT = "Dog"        # Concept to unlearn (e.g., "Dog", "Van_Gogh")
-TARGET_TYPE = "object"        # "style" or "object"
+# NOTE: TARGET_CONCEPT and TARGET_TYPE are defined further up (before the
+# FluxSteering init) so that STEERING_MODE can auto-pick. To change them,
+# edit the assignments above this cell, not here.
 # Steering defaults — both types use the same two entry-point hooks
 # (pre-hook on time_text_embed for CLIP-768, pre-hook on context_embedder
-# for T5-4096). Only the knobs differ:
+# for T5):
 #
 #   OBJECT — identity lives in CLIP pooled + a few T5 concept tokens.
 #            Top-k gate T5 to concept tokens, steer only the first 1-2
@@ -2097,13 +2267,21 @@ TARGET_TYPE = "object"        # "style" or "object"
 #     TOP_FRAC   = 1.0    # no gating
 #     STEP_RANGE = (0, N_STEPS)
 if TARGET_TYPE == "style":
+    # pincer_v2 (2 vectors): style is rank-1 + diffuse across all tokens
+    # and all steps. CLIP=0 because style is not in pooled CLIP for FLUX
+    # (per the diagnostic at the top of this file).
     BETA = {"clip": 0.0, "t5": 2.0}
     TOP_FRAC = 1.0
     STEP_RANGE = (0, N_STEPS)
 else:
-    BETA = {"clip": 3.0, "t5": 4.0}
+    # pincer_perstep (n_steps + 1 vectors): per-step T5 captures the
+    # timestep-specific concept signature; top_frac=0.15 localises
+    # subtraction to the actual concept tokens (leaving scene tokens
+    # alone); step_range=(0, 2) limits cumulative ablation to the
+    # early steps where object identity is committed.
+    BETA = {"clip": 1.0, "t5": 4.0}
     TOP_FRAC = 0.15
-    STEP_RANGE = (0, N_STEPS)
+    STEP_RANGE = (0, 2)
 
 # ==========================================================================
 # Automatic configuration
@@ -2167,11 +2345,16 @@ print(f"Mode: {STEERING_MODE}")
 # HYBRID mode: uses learn_vectors (single pos/neg pair + multiple seeds).
 #   This calls _learn_hybrid which hooks context_embedder + time_text_embed
 #   + add_k_proj + add_q_proj with mask-aware pooling across multiple seeds.
-#   This is the proven approach for STYLE unlearning.
 #
-# PINCER_V2 mode: uses learn_vectors_diverse (CASteer methodology).
-#   50 diverse contexts with the SAME seed. Averaging cancels context-
-#   specific noise, isolating the target concept. Best for OBJECT unlearning.
+# PINCER_PERSTEP mode (object): uses learn_vectors with multiple seeds,
+#   single pos/neg prompt. Per-step context_embedder OUTPUT hook captures
+#   timestep-specific concept signatures. This is the working 5-vector
+#   recipe; collateral damage is controlled at apply-time via top_frac
+#   (token gating) + step_range, not at learn-time.
+#
+# PINCER_V2 mode (style): uses learn_vectors_diverse (CASteer methodology).
+#   Diverse contexts cancel out, isolating the target concept. Style is
+#   rank-1 and diffuse, so 2 vectors (1 CLIP + 1 T5) suffice.
 # ===========================================================================
 if STEERING_MODE == "hybrid":
     # Hybrid mode: single prompt pair, multiple seeds (TRACE methodology)
@@ -2186,8 +2369,25 @@ if STEERING_MODE == "hybrid":
         verbose=True
     )
     vector_path = os.path.join(VECTOR_DIR, f"{TARGET_CONCEPT}_{STEERING_MODE}_vectors.pt")
+elif STEERING_MODE == "pincer_perstep":
+    # Pincer_perstep + object: single prompt pair, multiple seeds.
+    # Per-step T5 capture happens inside _learn_pincer_perstep via hooks
+    # on context_embedder OUTPUT during each pipeline pass.
+    print(f"Using single prompt pair with {len(LEARNING_SEEDS)} seeds "
+          f"(per-step EPO, working object recipe)")
+    print(f"  Positive: '{pos_prompt}'")
+    print(f"  Negative: '{neg_prompt}'\n")
+    vectors = steerer.learn_vectors(
+        pos_prompt=pos_prompt,
+        neg_prompt=neg_prompt,
+        seeds=LEARNING_SEEDS,
+        top_k=TOP_K_VECTORS,
+        verbose=True
+    )
+    vector_path = os.path.join(VECTOR_DIR, f"{TARGET_CONCEPT}_{STEERING_MODE}_vectors.pt")
 elif TARGET_TYPE == "object":
-    # Pincer_v2 + object: diverse prompt pairs (CASteer methodology)
+    # Legacy: pincer_v2 + object via diverse prompt pairs. Kept for
+    # comparison; pincer_perstep is the recommended object path.
     print(f"Using {len(DIVERSE_PROMPT_PAIRS)} diverse prompt pairs (CASteer methodology)")
     print(f"  Example: '{DIVERSE_PROMPT_PAIRS[0][0]}' vs '{DIVERSE_PROMPT_PAIRS[0][1]}'\n")
     vectors = steerer.learn_vectors_diverse(
