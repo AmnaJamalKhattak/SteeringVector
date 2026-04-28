@@ -249,23 +249,25 @@ def make_object_prompts(concept, num_prompts=50):
     """
     Generate diverse prompt pairs for OBJECT concept steering.
 
-    For object unlearning, two axes of diversity matter:
-      1. Scene variation (which scene the object lives in)
-      2. Within-class variation (which sub-type of the object)
+    Each pair is:
+        Positive: "{scene} with {concept}"
+        Negative: "{scene}, empty, no objects"
 
-    Without (2), the (pos - neg) diff matrix is rank-1 by construction and
-    SVD top-1 only captures the class centroid; generation then slides along
-    the unmodelled breed axis ("dog" -> different breed of dog). Sampling
-    sub-classes forces the diff matrix to expose internal variation so that
-    auto-rank SVD recovers the right number of directions to ablate.
+    The negative anchor explicitly states "empty, no objects" so the
+    learned (pos - neg) direction captures BOTH the object's identity
+    AND the spatial-reservation signal that "with X" introduces in the
+    prompt embedding. Subtracting that direction at inference removes
+    not just the object's appearance but also the model's tendency to
+    fill the foreground slot with a generic object — which is what was
+    producing the "glass bubble / wooden box / fountain dome" artifacts
+    where the dog/cat/bird used to be.
 
-    For a concept registered in OBJECT_SUBCLASSES (dog, cat, tree, car, ...)
-    each pair becomes:
-        Positive: "{scene} with {subclass_i}"
-        Negative: "{scene}"
-
-    Sub-classes are cycled across `num_prompts` pairs. If the concept is not
-    in OBJECT_SUBCLASSES, falls back to the legacy "{scene} with {concept}".
+    `OBJECT_SUBCLASSES` is still defined above for reference, but is
+    not used here: cycling sub-classes (golden retriever, poodle, ...)
+    diluted the per-pair concept signal by averaging breed-specific
+    directions instead of the class centroid. Sticking to the single
+    concept word ("Dog") in every positive keeps the diff aimed
+    squarely at the class.
 
     Args:
         concept: Object name (e.g., "Dog", "Cat")
@@ -275,11 +277,9 @@ def make_object_prompts(concept, num_prompts=50):
         List of (pos_prompt, neg_prompt) tuples
     """
     n = min(num_prompts, len(IMAGENET_CLASSES))
-    subs = _subclasses_for(concept)
     pairs = []
-    for i, cls in enumerate(IMAGENET_CLASSES[:n]):
-        sub = subs[i % len(subs)]
-        pairs.append((f"{cls} with {sub}", f"{cls}"))
+    for cls in IMAGENET_CLASSES[:n]:
+        pairs.append((f"{cls} with {concept}", f"{cls}, empty, no objects"))
     return pairs
 
 def make_style_prompts(concept, num_prompts=50):
