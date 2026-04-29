@@ -1,0 +1,2729 @@
+# -*- coding: utf-8 -*-
+"""CombinedUnlearnFlux.ipynb
+
+Combined recipe: STYLE unlearning (pincer_v2 — direct CLIP 768-d + direct T5
+4096-d pre-hooks) and OBJECT unlearning (pincer_perstep — direct CLIP 768-d
+with no cap + per-step T5 3072-d output hook on context_embedder).
+
+Style path is the working recipe from styleunlearnfluxOriginal.
+Object path is the working recipe from objectunlearnflux.
+
+# Steering Vectors for FLUX - UnlearnCanvas Benchmark Evaluation
+
+This notebook implements steering vectors for concept removal in FLUX and evaluates them using the **UnlearnCanvas benchmark** protocol.
+
+## Key Metrics (from UnlearnCanvas paper):
+- **UA (Unlearning Accuracy)**: Proportion of images NOT classified as target concept (higher = better unlearning)
+- **IRA (In-domain Retain Accuracy)**: Classification accuracy for other concepts in same domain (higher = better retention)
+- **CRA (Cross-domain Retain Accuracy)**: Classification accuracy for concepts in different domain (higher = better retention)
+- **FID**: Image quality metric (lower = better)
+- **CLIP Score**: Text-image alignment (higher = better)
+
+## Classification Method:
+This notebook uses **LLaVA-1.6-Vicuna-7B** as the classifier, following the methodology from the **TRACE paper** (ICLR 2026).
+
+The TRACE paper shows that UnlearnCanvas's original SD1.5-trained classifier generalizes poorly to modern models like FLUX (<6% accuracy). LLaVA provides accurate zero-shot classification using a numbered-list prompt format (see Appendix E.4, Figures 6-7 of TRACE paper).
+
+## Evaluation Approach:
+We generate images ourselves using FLUX + steering vectors, then evaluate using UnlearnCanvas protocol with LLaVA classification.
+"""
+
+# ============================================================================
+# CELL 1: INSTALLATIONS
+# ============================================================================
+
+!pip install torch torchvision torchaudio --quiet
+!pip install diffusers transformers accelerate --quiet
+!pip install clean-fid --quiet
+!pip install git+https://github.com/openai/CLIP.git --quiet
+!pip install timm --quiet
+!pip install pandas matplotlib pillow tqdm --quiet
+
+print("✓ All packages installed successfully!")
+
+# ============================================================================
+# CELL 2: IMPORTS AND CONFIGURATION
+# ============================================================================
+
+import os
+import torch
+import numpy as np
+from PIL import Image
+from diffusers import FluxPipeline
+from collections import defaultdict
+import matplotlib.pyplot as plt
+from contextlib import contextmanager
+from tqdm.auto import tqdm
+import pandas as pd
+import gc
+from cleanfid import fid
+import clip
+from torchvision import transforms
+import json
+from datetime import datetime
+
+# ============================================================================
+# GOOGLE DRIVE SETUP (Optional - for Colab)
+# ============================================================================
+USE_GOOGLE_DRIVE = True
+DRIVE_PATH = "/content/drive/MyDrive/UnlearnCanvas_Steering"
+
+if USE_GOOGLE_DRIVE:
+    try:
+        from google.colab import drive
+        drive.mount('/content/drive')
+        os.makedirs(DRIVE_PATH, exist_ok=True)
+        ROOT_DIR = DRIVE_PATH
+        print(f"✓ Google Drive mounted at: {ROOT_DIR}")
+    except:
+        print("⚠ Not in Colab or Drive mounting failed. Using local storage.")
+        ROOT_DIR = "."
+else:
+    ROOT_DIR = "."
+
+# ============================================================================
+# UNLEARNCANVAS BENCHMARK CONFIGURATION
+# Following the official UnlearnCanvas dataset structure:
+# - 60 styles (we use subset of 10 for efficiency)
+# - 20 object classes
+# ============================================================================
+
+# Full 60 styles from UnlearnCanvas (subset used for experiments)
+ALL_STYLES = [
+    "Abstractionism", "Art_Brut", "Art_Deco", "Art_Informel", "Art_Nouveau",
+    "Baroque", "Biedermeier", "Byzantine", "Cartoon", "Classicism",
+    "Color_Field_Painting", "Constructivism", "Crayon", "Cubism", "Dadaism",
+    "Divisionism", "Early_Renaissance", "Expressionism", "Fauvism", "Graffiti",
+    "High_Renaissance", "Impressionism", "International_Gothic", "Japonism", "Lyrical_Abstraction",
+    "Magic_Realism", "Mannerism", "Minimalism", "Naive_Art", "Neo-Baroque",
+    "Neo-Expressionism", "Neo-Impressionism", "Neo-Romanticism", "Neoclassicism", "Northern_Renaissance",
+    "Orphism", "Photo", "Pop_Art", "Post-Impressionism", "Post-Minimalism",
+    "Precision", "Primitivism", "Realism", "Rococo", "Romanesque",
+    "Romanticism", "Sketch", "Social_Realism", "Spatialism", "Suprematism",
+    "Surrealism", "Symbolism", "Synthetism", "Tachisme", "Ukiyoe",
+    "Van_Gogh", "Warm_Love", "Watercolor", "Winter", "Bricks"
+]
+
+# 10 styles from TRACE paper (ICLR 2026) for FLUX evaluation
+# Reference: TRACE Section 5.1 - main eval on Flux/SD3.5/Infinity
+# NOTE: TRACE Figure 6 (LLaVA prompt) shows 'Picasso' instead of 'Watercolor'
+# but Section 5.1 explicitly lists 'Watercolor' for the main FLUX evaluation.
+# 'Watercolor' is in the original 60 UnlearnCanvas styles; 'Picasso' is NOT.
+STYLES = [
+    "Van_Gogh", "Watercolor", "Cartoon", "Cubism", "Winter",
+    "Pop_Art", "Ukiyoe", "Impressionism", "Byzantine", "Bricks"
+]
+
+# All 20 object classes from UnlearnCanvas/TRACE paper (Figure 7)
+# Using singular form to match TRACE paper prompts exactly
+OBJECTS = [
+    "Architecture", "Bear", "Bird", "Butterfly", "Cat", "Dog",
+    "Fish", "Flame", "Flowers", "Frog", "Horse", "Human",
+    "Jellyfish", "Rabbits", "Sandwich", "Sea", "Statue",
+    "Tower", "Tree", "Waterfalls"
+]
+
+# Device configuration
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"✓ Using device: {DEVICE}")
+
+# Model configuration
+MODEL_ID = "black-forest-labs/FLUX.1-schnell"
+N_STEPS = 4 if "schnell" in MODEL_ID.lower() else 28
+
+# Steering vector configuration
+LEARNING_SEEDS = list(range(0, 20))  # 20 seeds for learning vectors
+EVAL_SEEDS = list(range(20, 23))     # 3 seeds for eval (increase for paper)
+GLOBAL_BETA = 2.0                     # Steering strength (from CASteer paper)
+TOP_K_VECTORS = 15                    # Top-k steering vectors to use
+
+# ============================================================================
+# IMAGENET CLASSES FOR DIVERSE PROMPT PAIRS (from CASteer paper)
+# CASteer uses 50 ImageNet classes as base contexts for computing steering
+# vectors. This ensures the contrastive vector isolates the TARGET concept
+# rather than prompt-specific features. Critical for object unlearning.
+# ============================================================================
+IMAGENET_CLASSES = [
+    "tench", "goldfish", "tiger shark", "hammerhead", "electric ray",
+    "hen", "ostrich", "brambling", "goldfinch", "house finch",
+    "junco", "indigo bunting", "robin", "bulbul", "jay",
+    "magpie", "chickadee", "water ouzel", "kite", "bald eagle",
+    "vulture", "great grey owl", "mud turtle", "box turtle", "banded gecko",
+    "common iguana", "whiptail lizard", "agama", "frilled lizard", "alligator lizard",
+    "green mamba", "thunder snake", "ringneck snake", "king snake", "garter snake",
+    "vine snake", "trilobite", "scorpion", "black widow", "tarantula",
+    "centipede", "grouse", "peacock", "quail", "partridge",
+    "macaw", "lorikeet", "coucal", "bee eater", "hornbill"
+]
+
+def make_object_prompts(concept, num_prompts=50):
+    """
+    Generate diverse prompt pairs for OBJECT concept steering (CASteer-style).
+
+    Uses ImageNet classes as diverse base contexts:
+      Positive: "tench with Dog", "goldfish with Dog", ...
+      Negative: "tench", "goldfish", ...
+
+    Averaging across many contexts ensures the contrastive vector isolates
+    the target object, not prompt-specific noise (layout, composition, etc.).
+
+    Args:
+        concept: Object name (e.g., "Dog", "Cat")
+        num_prompts: Number of diverse prompt pairs (default: 50, as in CASteer)
+
+    Returns:
+        List of (pos_prompt, neg_prompt) tuples
+    """
+    n = min(num_prompts, len(IMAGENET_CLASSES))
+    pairs = []
+    for cls in IMAGENET_CLASSES[:n]:
+        pairs.append((f"{cls} with {concept}", f"{cls}"))
+    return pairs
+
+def make_style_prompts(concept, num_prompts=50):
+    """
+    Generate diverse prompt pairs for STYLE concept steering (CASteer-style).
+
+    Uses ImageNet classes as diverse base contexts:
+      Positive: "tench, Van Gogh style", "goldfish, Van Gogh style", ...
+      Negative: "tench", "goldfish", ...
+
+    Args:
+        concept: Style name (e.g., "Van Gogh", "Cartoon")
+        num_prompts: Number of diverse prompt pairs (default: 50)
+
+    Returns:
+        List of (pos_prompt, neg_prompt) tuples
+    """
+    n = min(num_prompts, len(IMAGENET_CLASSES))
+    pairs = []
+    for cls in IMAGENET_CLASSES[:n]:
+        pairs.append((f"{cls}, {concept} style", f"{cls}"))
+    return pairs
+
+NUM_DIVERSE_PROMPTS = 50  # Number of diverse prompt pairs for learning
+
+# Set True to run full benchmark across ALL 10 styles in Cell 13.
+# WARNING: generates 10x20x3 = 600 images PER target + LLaVA classification.
+RUN_FULL_BENCHMARK = False
+
+# Directory structure
+for subdir in ["steering_vectors", "results", "baseline_images", "steered_images", "tables"]:
+    os.makedirs(os.path.join(ROOT_DIR, subdir), exist_ok=True)
+
+VECTOR_DIR = os.path.join(ROOT_DIR, "steering_vectors")
+RESULTS_DIR = os.path.join(ROOT_DIR, "results")
+BASELINE_DIR = os.path.join(ROOT_DIR, "baseline_images")
+STEERED_DIR = os.path.join(ROOT_DIR, "steered_images")
+TABLES_DIR = os.path.join(ROOT_DIR, "tables")
+RESULTS_CSV = os.path.join(ROOT_DIR, "benchmark_results.csv")
+
+print("\n" + "="*70)
+print("UNLEARNCANVAS BENCHMARK CONFIGURATION")
+print("="*70)
+print(f"Model: {MODEL_ID}")
+print(f"Inference steps: {N_STEPS}")
+print(f"Learning seeds: {len(LEARNING_SEEDS)}")
+print(f"Evaluation seeds: {len(EVAL_SEEDS)}")
+print(f"Styles to evaluate: {len(STYLES)}")
+print(f"Objects to evaluate: {len(OBJECTS)}")
+print(f"Steering strength (β): {GLOBAL_BETA}")
+print("="*70)
+
+# ============================================================================
+# CELL 3: FLUXSTEERING CLASS (2 MODES: hybrid + pincer_v2)
+# ============================================================================
+"""
+FluxSteering: Implements activation steering for FLUX diffusion models.
+
+ARCHITECTURE INSIGHT (from diagnostic zeroing experiments):
+  FLUX has TWO independent text paths:
+    CLIP path:  pooled_text -> time_text_embed -> shift/scale MODULATION -> every block
+    T5 path:    T5_embeddings -> context_embedder -> add_k/add_q -> joint attention
+
+  Zeroing time_text_embed (CLIP) = pure noise -> CLIP IS the concept source
+  Zeroing context_embedder (T5)  = still a dog -> T5 path irrelevant for object identity
+
+  CRITICAL: add_k_proj / add_q_proj operate on T5 context (the IRRELEVANT path).
+  Object identity flows through CLIP -> modulation, NOT through T5 -> attention K/Q.
+
+Two modes:
+
+MODE 1: "hybrid" (TRACE entry points + CASteer add_k/add_q) -- STYLE UNLEARNING
+    Steers at:
+      - context_embedder: Linear(4096 -> 3072) -- projects T5 encoder output
+      - time_text_embed: MLP -- fuses timestep + CLIP pooled text
+      - add_k_proj + add_q_proj in 19 DoubleStream blocks -- text-side K/Q
+    Uses mask-aware pooling. Keeps all vectors. Best for style removal.
+    (Style IS carried through T5 descriptions, so add_k/add_q is correct here.)
+
+MODE 2: "pincer_v2" (Entry-Point-Only / EPO) -- OBJECT UNLEARNING
+    Steers at ONLY the two text entry points:
+      - time_text_embed (CLIP): weakens global concept modulation at its SOURCE.
+        Small beta because this controls ALL 57 blocks via AdaLN.
+      - context_embedder (T5): removes concept-related token information BEFORE
+        it enters add_k/q_proj attention. Per-token steering naturally targets
+        concept words while leaving scene tokens alone.
+
+    WHY NOT to_out[0]? The old approach averaged over ALL image patches, which
+    entangles object with background (Tree+sky+grass -> "nature scene" collapse,
+    Cat+background -> morphing, Tower geometry -> persistence). By steering
+    ONLY at entry points, we remove the concept instruction BEFORE it reaches
+    image generation. No image patches = no entanglement.
+
+    Per-component beta: CLIP is fragile (carries ALL conditioning), needs gentle
+    beta. T5 is more localized (only affects attention K/Q), tolerates more.
+      beta={"clip": 3.0, "t5": 5.0}
+
+    CLIP is steered as a PRE-HOOK on time_text_embed INPUT (768-d pooled
+    embedding, before SiLU). This avoids the SiLU nonlinearity that made
+    the old output-hook approach ineffective for object unlearning.
+
+    Total: n_steps + 1 vectors (context_embedder per-step + 1 clip_768).
+"""
+
+class FluxSteering:
+    """
+    FluxSteering: inference-time concept removal in FLUX.
+
+    Modes:
+      "hybrid"         -- legacy hybrid (TRACE entry points + CASteer add_k/add_q)
+      "pincer_v2"      -- STYLE unlearning (EPO: direct CLIP 768-d pre-hook
+                          + direct T5 4096-d pre-hook on context_embedder INPUT)
+      "pincer_perstep" -- OBJECT unlearning (EPO: direct CLIP 768-d pre-hook
+                          + per-step T5 3072-d output hook on context_embedder
+                          OUTPUT, learned via pipeline runs over N seeds)
+    """
+
+    VALID_MODES = ("hybrid", "pincer_v2", "pincer_perstep")
+
+    def __init__(self, pipe, device="cuda", n_steps=4, mode="hybrid"):
+        self.pipe = pipe
+        self.device = device
+        self.n_steps = n_steps
+        self.mode = mode
+        self._current_step = -1
+        self._handles = []
+        self._current_attention_mask = None
+
+        if mode not in self.VALID_MODES:
+            raise ValueError(
+                f"Unknown mode '{mode}'. Choose from {self.VALID_MODES}."
+            )
+
+        # ==============================================================
+        # Resolve layer references
+        # ==============================================================
+
+        # --- Entry-point layers ---
+        self.target_layers = {
+            "context_embedder": pipe.transformer.context_embedder,
+            "time_text_embed": pipe.transformer.time_text_embed,
+        }
+
+        # --- DoubleStream blocks ---
+        self.double_layers = [
+            m for m in pipe.transformer.modules()
+            if m.__class__.__name__ == "FluxTransformerBlock"
+        ]
+        self.double_layer_idxs = list(range(len(self.double_layers)))
+
+        # attn output projections (to_out[0] -- kept for reference/legacy)
+        self.double_proj_layers = {
+            li: self.double_layers[li].attn.to_out[0]
+            for li in self.double_layer_idxs
+        }
+
+        # text-side Key and Query projections (used by hybrid)
+        self.double_add_k = {}
+        self.double_add_q = {}
+        for li in self.double_layer_idxs:
+            attn = self.double_layers[li].attn
+            if hasattr(attn, "add_k_proj"):
+                self.double_add_k[li] = attn.add_k_proj
+            if hasattr(attn, "add_q_proj"):
+                self.double_add_q[li] = attn.add_q_proj
+
+        # --- Print summary ---
+        summary = {
+            "hybrid": (
+                f"  - TRACE entry points: context_embedder + time_text_embed (2)\n"
+                f"  - CASteer-adapted: add_k_proj ({len(self.double_add_k)}) + add_q_proj ({len(self.double_add_q)})\n"
+                f"  - Total control points: {2 + len(self.double_add_k) + len(self.double_add_q)} + mask-aware pooling"
+            ),
+            "pincer_v2": (
+                f"  - Entry-Point-Only (EPO) steering -- STYLE recipe:\n"
+                f"  - CLIP direction (768-d) -> pre-hook on time_text_embed INPUT (before SiLU)\n"
+                f"  - T5   direction (4096-d) -> pre-hook on context_embedder INPUT\n"
+                f"    (raw T5 hidden states, before Linear + downstream AdaLayerNormZero)\n"
+                f"  - CLIP score capped at min(beta_clip, clip_cap=1.0) to prevent over-removal\n"
+                f"  - T5 hook supports top-k token gating (top_frac) + step gating (step_range)\n"
+                f"  - Style : top_frac=1.0, step_range=(0,{self.n_steps}), beta={{'clip':0, 't5':2}}\n"
+                f"  - No image patches hooked (avoids background entanglement)"
+            ),
+            "pincer_perstep": (
+                f"  - Per-step EPO steering -- OBJECT recipe:\n"
+                f"  - CLIP direction (768-d) -> pre-hook on time_text_embed INPUT (before SiLU)\n"
+                f"    NO cap by default (clip_cap=None) so beta_clip > 1 can push past zero.\n"
+                f"  - T5 directions ({self.n_steps} x 3072-d) -> output hook on context_embedder\n"
+                f"    one direction per denoising step, learned via pipeline runs.\n"
+                f"  - Object: beta={{'clip':3, 't5':5}}\n"
+                f"  - Total: {self.n_steps} + 1 vectors (context_embedder per-step + clip_768)"
+            ),
+        }
+        print(f"FluxSteering initialized (mode={mode}):")
+        print(summary[mode])
+
+    # ==================================================================
+    # Internal helpers
+    # ==================================================================
+    def _on_step_end(self, pipe, step, timestep, callback_kwargs):
+        self._current_step = int(step.item()) if torch.is_tensor(step) else int(step)
+        return callback_kwargs
+
+    def _clear_hooks(self):
+        for h in self._handles:
+            h.remove()
+        self._handles = []
+
+    def _get_t5_mask(self, prompt):
+        tokenizer = self.pipe.tokenizer_2
+        max_seq = getattr(self.pipe, '_max_sequence_length', 512)
+        tok_out = tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=max_seq,
+            truncation=True,
+            return_tensors="pt",
+        )
+        mask = tok_out.attention_mask
+        n_real = int(mask.sum().item())
+        return mask.to(self.device), n_real
+
+    def _masked_mean(self, act, mask):
+        mask_f = mask.to(device=act.device, dtype=act.dtype)
+        mask_exp = mask_f.unsqueeze(-1)
+        weighted = (act * mask_exp).sum(dim=(0, 1))
+        count = mask_exp.sum(dim=(0, 1)).clamp(min=1.0)
+        return weighted / count
+
+    def _get_t5_embeddings_and_mask(self, prompt):
+        """Raw T5 hidden states (1, seq, 4096) + attention mask (1, seq).
+
+        This is the T5 analog of `_get_clip_prompt_embeds`: the per-token
+        output of the T5 encoder BEFORE `transformer.context_embedder`.
+        Used to learn a 4096-d T5 steering direction without running the
+        denoising pipeline.
+        """
+        max_seq = getattr(self.pipe, '_max_sequence_length', 512)
+        mask, _ = self._get_t5_mask(prompt)
+        embeds = self.pipe._get_t5_prompt_embeds(
+            prompt=prompt,
+            num_images_per_prompt=1,
+            max_sequence_length=max_seq,
+            device=self.device,
+            dtype=self.pipe.text_encoder_2.dtype,
+        )
+        return embeds.float(), mask
+
+    def _run_pipe_base(self, prompt, seed, steps=None):
+        steps = steps or self.n_steps
+        self._current_step = -1
+        g = torch.Generator(device=self.device).manual_seed(seed)
+        return self.pipe(
+            prompt=prompt,
+            num_inference_steps=steps,
+            generator=g,
+            callback_on_step_end=self._on_step_end
+        ).images[0]
+
+    # ==================================================================
+    # LEARN VECTORS -- dispatcher
+    # ==================================================================
+    @torch.no_grad()
+    def learn_vectors(self, pos_prompt, neg_prompt, seeds, top_k=15, verbose=True):
+        """Learn steering vectors from positive/negative prompt pairs."""
+        if self.mode == "hybrid":
+            return self._learn_hybrid(pos_prompt, neg_prompt, seeds, verbose)
+        elif self.mode == "pincer_v2":
+            return self._learn_pincer_v2(pos_prompt, neg_prompt, seeds, verbose)
+        elif self.mode == "pincer_perstep":
+            return self._learn_pincer_perstep(pos_prompt, neg_prompt, seeds, verbose)
+
+    # ==================================================================
+    # LEARN: hybrid (TRACE entry points + CASteer add_k/add_q)
+    # ==================================================================
+    def _learn_hybrid(self, pos_prompt, neg_prompt, seeds, verbose):
+        """
+        Hybrid: context_embedder + time_text_embed + add_k_proj + add_q_proj.
+        Mask-aware pooling. Keeps ALL vectors.
+        """
+        pos_mask, pos_n = self._get_t5_mask(pos_prompt)
+        neg_mask, neg_n = self._get_t5_mask(neg_prompt)
+        if verbose:
+            print(f"T5 mask: pos has {pos_n} real tokens, neg has {neg_n} real tokens (out of {pos_mask.shape[1]})")
+
+        mean_diffs = defaultdict(lambda: defaultdict(float))
+        counts = defaultdict(lambda: defaultdict(int))
+
+        def hook_fn(layer_name, sign):
+            def hook(module, inputs, output):
+                step = self._current_step + 1
+                if 0 <= step < self.n_steps:
+                    act = output.detach().float()
+                    if act.dim() == 3:
+                        mean_act = self._masked_mean(act, self._current_attention_mask)
+                    else:
+                        mean_act = act.mean(dim=tuple(range(act.dim() - 1)))
+                    mean_diffs[layer_name][step] += (sign * mean_act)
+                    counts[layer_name][step] += 1
+                return output
+            return hook
+
+        def _run_pass(prompt, mask, sign, desc):
+            self._current_attention_mask = mask
+            for seed in tqdm(seeds, desc=desc, disable=not verbose):
+                self._clear_hooks()
+                for name, mod in self.target_layers.items():
+                    self._handles.append(mod.register_forward_hook(hook_fn(name, sign)))
+                for idx, mod in self.double_add_k.items():
+                    self._handles.append(mod.register_forward_hook(hook_fn(f"add_k_{idx}", sign)))
+                for idx, mod in self.double_add_q.items():
+                    self._handles.append(mod.register_forward_hook(hook_fn(f"add_q_{idx}", sign)))
+                self._run_pipe_base(prompt, seed)
+
+        try:
+            _run_pass(pos_prompt, pos_mask, +1, "Hybrid learning (+)")
+            _run_pass(neg_prompt, neg_mask, -1, "Hybrid learning (-)")
+        finally:
+            self._clear_hooks()
+            self._current_attention_mask = None
+
+        return self._build_vectors_keep_all(mean_diffs, counts, len(seeds), verbose,
+                                             title="Hybrid Steering Vectors (TRACE entry + CASteer add_k/add_q)")
+
+    # ==================================================================
+    # LEARN: pincer_v2 / EPO (Entry-Point-Only -- object unlearning)
+    # ==================================================================
+    def _learn_pincer_v2(self, pos_prompt, neg_prompt, seeds, verbose):
+        """
+        Entry-Point-Only (EPO) steering — direct-embedding learning.
+
+        Both text paths are learned directly from their encoder outputs,
+        so no pipeline runs are needed.
+
+        CLIP path (768-d): `_get_clip_prompt_embeds` → pooled embedding.
+          Steered as a pre-hook on `time_text_embed` INPUT (pre-SiLU).
+
+        T5 path (4096-d): `_get_t5_prompt_embeds` → raw per-token hidden
+          states, mask-aware mean pooled. Steered as a pre-hook on
+          `context_embedder` INPUT, BEFORE the downstream AdaLayerNormZero
+          in every FluxTransformerBlock renormalizes the tokens.
+
+        Produces two vectors: `clip_768` (key) and `t5_4096` (key), each a
+        single direction at step 0 (applied at every denoising step).
+        `seeds` is ignored (kept in the signature for API compatibility).
+        """
+        if verbose:
+            print(f"EPO learning (direct): CLIP 768-d + T5 4096-d, no pipeline runs")
+
+        # --- CLIP: direct pooled embedding ---
+        clip_pos = self.pipe._get_clip_prompt_embeds(
+            prompt=pos_prompt, device=self.device
+        ).squeeze(0).float()  # (768,)
+        clip_neg = self.pipe._get_clip_prompt_embeds(
+            prompt=neg_prompt, device=self.device
+        ).squeeze(0).float()
+        clip_diff = clip_pos - clip_neg
+        clip_strength = float(clip_diff.norm())
+        clip_direction = clip_diff / (clip_diff.norm() + 1e-8)
+
+        # --- T5: raw per-token embeddings, mask-aware mean pool ---
+        t5_pos, pos_mask = self._get_t5_embeddings_and_mask(pos_prompt)  # (1,seq,4096)
+        t5_neg, neg_mask = self._get_t5_embeddings_and_mask(neg_prompt)
+        t5_pos_pool = self._masked_mean(t5_pos, pos_mask)  # (4096,)
+        t5_neg_pool = self._masked_mean(t5_neg, neg_mask)
+        t5_diff = t5_pos_pool - t5_neg_pool
+        t5_strength = float(t5_diff.norm())
+        t5_direction = t5_diff / (t5_diff.norm() + 1e-8)
+
+        if verbose:
+            print(f"{'Layer':<25} {'Step':<6} {'Strength':<12}")
+            print(f"{'-'*70}")
+            print(f"{'clip_768':<25} {'0':<6} {clip_strength:<12.4f}")
+            print(f"{'t5_4096':<25} {'0':<6} {t5_strength:<12.4f}")
+            print(f"{'-'*70}")
+            print(f"Total vectors: 2 (clip_768 + t5_4096)")
+
+        return {
+            "clip_768": {0: clip_direction},
+            "t5_4096": {0: t5_direction},
+        }
+
+    # ==================================================================
+    # LEARN: pincer_perstep (per-step T5 -- OBJECT unlearning)
+    # ------------------------------------------------------------------
+    # Working object recipe ported from objectunlearnflux.py:
+    #   * CLIP path: direct pooled embedding (768-d) -> pre-hook on
+    #     time_text_embed INPUT, applied at every denoising step. No
+    #     cap (clip_cap=None) so beta_clip > 1 pushes past zero.
+    #   * T5 path: hook context_embedder OUTPUT (3072-d, post-projection)
+    #     during pipeline runs. For each (pos, neg) seed pair, accumulate
+    #     masked-mean(act_pos) - masked-mean(act_neg) per denoising step.
+    #     The result is one direction per step; identity is committed across
+    #     several steps and the operative space evolves with the timestep.
+    #   * Single (pos, neg) prompt x N seeds: noise variance averages
+    #     across seeds, the concept direction adds coherently.
+    # ==================================================================
+    def _learn_pincer_perstep(self, pos_prompt, neg_prompt, seeds, verbose):
+        """
+        Per-step EPO learning for OBJECT unlearning.
+
+        Returns:
+            {"clip_768": {0: clip_direction},
+             "context_embedder": {step: dir for step in 0..n_steps-1}}
+        """
+        pos_mask, pos_n = self._get_t5_mask(pos_prompt)
+        neg_mask, neg_n = self._get_t5_mask(neg_prompt)
+        if verbose:
+            print(f"EPO learning: CLIP via _get_clip_prompt_embeds (768-d, pre-SiLU)")
+            print(f"EPO learning: context_embedder via output hooks (mask-aware)")
+            print(f"T5 mask: pos has {pos_n} real tokens, neg has {neg_n} real tokens (out of {pos_mask.shape[1]})")
+
+        # --- CLIP: direct embedding, no pipeline run needed ---
+        clip_pos = self.pipe._get_clip_prompt_embeds(
+            prompt=pos_prompt, device=self.device
+        )  # (1, 768)
+        clip_neg = self.pipe._get_clip_prompt_embeds(
+            prompt=neg_prompt, device=self.device
+        )  # (1, 768)
+        clip_diff = (clip_pos.squeeze(0) - clip_neg.squeeze(0)).float()
+        clip_strength = float(clip_diff.norm())
+        clip_direction = clip_diff / (clip_diff.norm() + 1e-8)
+        if verbose:
+            print(f"CLIP direction: dim={clip_direction.shape[0]}, strength={clip_strength:.4f}")
+
+        # --- T5 / context_embedder: pipeline runs with per-step hooks ---
+        mean_diffs = defaultdict(lambda: defaultdict(float))
+        counts = defaultdict(lambda: defaultdict(int))
+
+        def hook_fn(layer_name, sign):
+            def hook(module, inputs, output):
+                step = self._current_step + 1
+                if 0 <= step < self.n_steps:
+                    act = output.detach().float()
+                    if act.dim() == 3:
+                        mean_act = self._masked_mean(act, self._current_attention_mask)
+                    else:
+                        mean_act = act.mean(dim=tuple(range(act.dim() - 1)))
+                    mean_diffs[layer_name][step] += (sign * mean_act)
+                    counts[layer_name][step] += 1
+                return output
+            return hook
+
+        ctx_mod = self.target_layers["context_embedder"]
+
+        def _run_pass(prompt, mask, sign, desc):
+            self._current_attention_mask = mask
+            for seed in tqdm(seeds, desc=desc, disable=not verbose):
+                self._clear_hooks()
+                self._handles.append(ctx_mod.register_forward_hook(
+                    hook_fn("context_embedder", sign)
+                ))
+                self._run_pipe_base(prompt, seed)
+
+        try:
+            _run_pass(pos_prompt, pos_mask, +1, "EPO T5 learning (+)")
+            _run_pass(neg_prompt, neg_mask, -1, "EPO T5 learning (-)")
+        finally:
+            self._clear_hooks()
+            self._current_attention_mask = None
+
+        # Build T5 vectors (mean-of-diffs across seeds, per step)
+        vectors = dict(self._build_vectors_keep_all(
+            mean_diffs, counts, len(seeds), verbose,
+            title="EPO Steering Vectors -- T5 / context_embedder"
+        ))
+
+        # Add CLIP vector under key "clip_768", step 0 (same at every step)
+        vectors["clip_768"] = {0: clip_direction}
+        if verbose:
+            print(f"{'clip_768':<25} {'0':<6} {clip_strength:<12.4f}")
+            total = sum(len(v) for v in vectors.values())
+            print(f"Total vectors (incl. clip_768): {total}")
+
+        return vectors
+
+    # ==================================================================
+    # LEARN: learn_vectors_diverse (MULTI-PROMPT)
+    # ==================================================================
+    @torch.no_grad()
+    def learn_vectors_diverse(self, prompt_pairs, seed=0, top_k=15, verbose=True):
+        """
+        Learn steering vectors from DIVERSE prompt pairs (CASteer methodology).
+
+        For each (pos_prompt, neg_prompt) pair:
+          1. Get activations for pos_prompt, neg_prompt
+          2. Accumulate: diff += activation(pos) - activation(neg)
+        Final vector = mean(diffs) / ||mean(diffs)||
+
+        The diverse contexts cancel out, leaving only the concept-specific direction.
+
+        pincer_v2 mode: computes CLIP (768-d) and T5 (4096-d) directions
+        DIRECTLY from `_get_clip_prompt_embeds` and `_get_t5_prompt_embeds`
+        — no pipeline runs, so learning is orders of magnitude faster.
+
+        hybrid mode: unchanged — runs the pipeline with hooks on
+        context_embedder + time_text_embed + add_k_proj + add_q_proj.
+        """
+        n_pairs = len(prompt_pairs)
+        if verbose:
+            print(f"Learning from {n_pairs} diverse prompt pairs (seed={seed})")
+            print(f"Mode: {self.mode}")
+
+        # ------------------------------------------------------------------
+        # pincer_v2: direct-embedding path (no pipeline runs)
+        # ------------------------------------------------------------------
+        if self.mode == "pincer_v2":
+            clip_diff_accum = None
+            t5_diff_accum = None
+            for pair_idx, (pos_prompt, neg_prompt) in enumerate(
+                tqdm(prompt_pairs, desc="Diverse pairs (CLIP+T5 direct)", disable=not verbose)
+            ):
+                # CLIP (pooled, 768-d)
+                clip_pos = self.pipe._get_clip_prompt_embeds(
+                    prompt=pos_prompt, device=self.device
+                ).squeeze(0).float()
+                clip_neg = self.pipe._get_clip_prompt_embeds(
+                    prompt=neg_prompt, device=self.device
+                ).squeeze(0).float()
+                d_clip = clip_pos - clip_neg
+
+                # T5 (per-token 4096-d → mask-aware mean pool)
+                t5_pos, pos_mask = self._get_t5_embeddings_and_mask(pos_prompt)
+                t5_neg, neg_mask = self._get_t5_embeddings_and_mask(neg_prompt)
+                d_t5 = self._masked_mean(t5_pos, pos_mask) - self._masked_mean(t5_neg, neg_mask)
+
+                clip_diff_accum = d_clip if clip_diff_accum is None else clip_diff_accum + d_clip
+                t5_diff_accum = d_t5 if t5_diff_accum is None else t5_diff_accum + d_t5
+
+                if verbose and (pair_idx + 1) % 10 == 0:
+                    print(f"  Completed {pair_idx + 1}/{n_pairs} prompt pairs")
+
+            clip_avg = clip_diff_accum / n_pairs
+            t5_avg = t5_diff_accum / n_pairs
+            clip_strength = float(clip_avg.norm())
+            t5_strength = float(t5_avg.norm())
+            clip_direction = clip_avg / (clip_avg.norm() + 1e-8)
+            t5_direction = t5_avg / (t5_avg.norm() + 1e-8)
+
+            if verbose:
+                print(f"\n{'='*70}")
+                print(f"Diverse-Prompt Steering Vectors (pincer_v2, {n_pairs} pairs)")
+                print(f"{'='*70}")
+                print(f"{'Layer':<25} {'Step':<6} {'Strength':<12}")
+                print(f"{'-'*70}")
+                print(f"{'clip_768':<25} {'0':<6} {clip_strength:<12.4f}")
+                print(f"{'t5_4096':<25} {'0':<6} {t5_strength:<12.4f}")
+                print(f"{'-'*70}")
+                print(f"Total vectors: 2 (clip_768 + t5_4096)")
+                print(f"{'='*70}\n")
+
+            return {
+                "clip_768": {0: clip_direction},
+                "t5_4096": {0: t5_direction},
+            }
+
+        # ------------------------------------------------------------------
+        # pincer_perstep: per-step T5 output hook + direct-CLIP path.
+        # Mirrors the working object recipe from objectunlearnflux. For
+        # each (pos, neg) pair, run pipeline with a hook on the
+        # context_embedder OUTPUT (3072-d post-projection) and accumulate
+        # per-step masked-mean diffs. CLIP is computed directly per pair
+        # and averaged.
+        # ------------------------------------------------------------------
+        if self.mode == "pincer_perstep":
+            mean_diffs = defaultdict(lambda: defaultdict(float))
+            counts = defaultdict(lambda: defaultdict(int))
+            clip_diff_accum = None
+
+            ctx_mod = self.target_layers["context_embedder"]
+
+            def make_ctx_hook(s):
+                def hook(module, inputs, output):
+                    step = self._current_step + 1
+                    if 0 <= step < self.n_steps:
+                        act = output.detach().float()
+                        if act.dim() == 3:
+                            mean_act = self._masked_mean(act, self._current_attention_mask)
+                        else:
+                            mean_act = act.mean(dim=tuple(range(act.dim() - 1)))
+                        mean_diffs["context_embedder"][step] += (s * mean_act)
+                        counts["context_embedder"][step] += 1
+                    return output
+                return hook
+
+            try:
+                for pair_idx, (pos_prompt, neg_prompt) in enumerate(
+                    tqdm(prompt_pairs, desc="Diverse pairs (CLIP direct + T5 per-step)",
+                         disable=not verbose)
+                ):
+                    # CLIP: direct pooled embedding per pair
+                    clip_pos = self.pipe._get_clip_prompt_embeds(
+                        prompt=pos_prompt, device=self.device
+                    ).squeeze(0).float()
+                    clip_neg = self.pipe._get_clip_prompt_embeds(
+                        prompt=neg_prompt, device=self.device
+                    ).squeeze(0).float()
+                    d_clip = clip_pos - clip_neg
+                    clip_diff_accum = d_clip if clip_diff_accum is None else clip_diff_accum + d_clip
+
+                    pos_mask, _ = self._get_t5_mask(pos_prompt)
+                    neg_mask, _ = self._get_t5_mask(neg_prompt)
+
+                    # Positive pass
+                    self._clear_hooks()
+                    self._current_attention_mask = pos_mask
+                    self._handles.append(ctx_mod.register_forward_hook(make_ctx_hook(+1)))
+                    self._run_pipe_base(pos_prompt, seed)
+
+                    # Negative pass
+                    self._clear_hooks()
+                    self._current_attention_mask = neg_mask
+                    self._handles.append(ctx_mod.register_forward_hook(make_ctx_hook(-1)))
+                    self._run_pipe_base(neg_prompt, seed)
+
+                    if verbose and (pair_idx + 1) % 10 == 0:
+                        print(f"  Completed {pair_idx + 1}/{n_pairs} prompt pairs")
+            finally:
+                self._clear_hooks()
+                self._current_attention_mask = None
+
+            vectors = dict(self._build_vectors_keep_all(
+                mean_diffs, counts, n_pairs, verbose,
+                title=f"Diverse-Prompt Steering Vectors (pincer_perstep, {n_pairs} pairs)"
+            ))
+            clip_avg = clip_diff_accum / n_pairs
+            clip_strength = float(clip_avg.norm())
+            clip_direction = clip_avg / (clip_avg.norm() + 1e-8)
+            vectors["clip_768"] = {0: clip_direction}
+            if verbose:
+                print(f"{'clip_768':<25} {'0':<6} {clip_strength:<12.4f}")
+                total = sum(len(v) for v in vectors.values())
+                print(f"Total vectors (incl. clip_768): {total}")
+            return vectors
+
+        # ------------------------------------------------------------------
+        # hybrid: legacy pipeline-with-hooks path (unchanged)
+        # ------------------------------------------------------------------
+        mean_diffs = defaultdict(lambda: defaultdict(float))
+        counts = defaultdict(lambda: defaultdict(int))
+
+        def _get_hooks_for_mode(sign):
+            hooks = []
+
+            if self.mode == "hybrid":
+                # Both context_embedder + time_text_embed
+                for name, mod in self.target_layers.items():
+                    def make_entry_hook(layer_name, s):
+                        def hook(module, inputs, output):
+                            step = self._current_step + 1
+                            if 0 <= step < self.n_steps:
+                                act = output.detach().float()
+                                if layer_name == "context_embedder" and act.dim() == 3:
+                                    mean_act = self._masked_mean(act, self._current_attention_mask)
+                                else:
+                                    mean_act = act.mean(dim=tuple(range(act.dim() - 1)))
+                                mean_diffs[layer_name][step] += (s * mean_act)
+                                counts[layer_name][step] += 1
+                            return output
+                        return hook
+                    hooks.append((mod, make_entry_hook(name, sign)))
+
+                # add_k_proj and add_q_proj (hybrid only -- T5 path matters for style)
+                for li, mod in self.double_add_k.items():
+                    def make_addk_hook(layer_idx, s):
+                        def hook(module, inputs, output):
+                            step = self._current_step + 1
+                            if 0 <= step < self.n_steps:
+                                act = output.detach().float()
+                                if act.dim() == 3:
+                                    mean_act = self._masked_mean(act, self._current_attention_mask)
+                                else:
+                                    mean_act = act.mean(dim=tuple(range(act.dim() - 1)))
+                                mean_diffs[f"add_k_{layer_idx}"][step] += (s * mean_act)
+                                counts[f"add_k_{layer_idx}"][step] += 1
+                            return output
+                        return hook
+                    hooks.append((mod, make_addk_hook(li, sign)))
+
+                for li, mod in self.double_add_q.items():
+                    def make_addq_hook(layer_idx, s):
+                        def hook(module, inputs, output):
+                            step = self._current_step + 1
+                            if 0 <= step < self.n_steps:
+                                act = output.detach().float()
+                                if act.dim() == 3:
+                                    mean_act = self._masked_mean(act, self._current_attention_mask)
+                                else:
+                                    mean_act = act.mean(dim=tuple(range(act.dim() - 1)))
+                                mean_diffs[f"add_q_{layer_idx}"][step] += (s * mean_act)
+                                counts[f"add_q_{layer_idx}"][step] += 1
+                            return output
+                        return hook
+                    hooks.append((mod, make_addq_hook(li, sign)))
+
+            return hooks
+
+        try:
+            for pair_idx, (pos_prompt, neg_prompt) in enumerate(
+                tqdm(prompt_pairs, desc="Diverse prompt pairs", disable=not verbose)
+            ):
+                pos_mask, _ = self._get_t5_mask(pos_prompt)
+                neg_mask, _ = self._get_t5_mask(neg_prompt)
+
+                # Positive pass
+                self._clear_hooks()
+                self._current_attention_mask = pos_mask
+                for mod, hook_fn in _get_hooks_for_mode(+1):
+                    self._handles.append(mod.register_forward_hook(hook_fn))
+                self._run_pipe_base(pos_prompt, seed)
+
+                # Negative pass
+                self._clear_hooks()
+                self._current_attention_mask = neg_mask
+                for mod, hook_fn in _get_hooks_for_mode(-1):
+                    self._handles.append(mod.register_forward_hook(hook_fn))
+                self._run_pipe_base(neg_prompt, seed)
+
+                if verbose and (pair_idx + 1) % 10 == 0:
+                    print(f"  Completed {pair_idx + 1}/{n_pairs} prompt pairs")
+
+        finally:
+            self._clear_hooks()
+            self._current_attention_mask = None
+
+        return dict(self._build_vectors_keep_all(
+            mean_diffs, counts, n_pairs, verbose,
+            title=f"Diverse-Prompt Steering Vectors ({self.mode}, {n_pairs} pairs)"
+        ))
+
+    # ==================================================================
+    # Vector builders
+    # ==================================================================
+    def _build_vectors_keep_all(self, mean_diffs, counts, n_seeds, verbose, title="Steering Vectors"):
+        vectors = defaultdict(dict)
+        if verbose:
+            print(f"\n{'='*70}")
+            print(title)
+            print(f"{'='*70}")
+            print(f"{'Layer':<25} {'Step':<6} {'Strength':<12}")
+            print(f"{'-'*70}")
+
+        for name in sorted(mean_diffs.keys()):
+            for step in sorted(mean_diffs[name].keys()):
+                if counts[name][step] == 0:
+                    continue
+                avg_diff = mean_diffs[name][step] / n_seeds
+                strength = float(avg_diff.norm())
+                direction = avg_diff / (avg_diff.norm() + 1e-8)
+                vectors[name][step] = direction
+                if verbose:
+                    print(f"{name:<25} {step:<6} {strength:<12.4f}")
+
+        if verbose:
+            total = sum(len(v) for v in vectors.values())
+            print(f"{'-'*70}")
+            print(f"Total vectors: {total}")
+            print(f"{'='*70}\n")
+        return dict(vectors)
+
+    def _build_vectors_topk(self, mean_diffs, counts, n_seeds, top_k, verbose, title="Steering Vectors"):
+        candidates = []
+        for li in mean_diffs:
+            for step in mean_diffs[li]:
+                if counts[li][step] == 0:
+                    continue
+                avg_diff = mean_diffs[li][step] / n_seeds
+                candidates.append((float(avg_diff.norm()), li, step, avg_diff))
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        top_candidates = candidates[:top_k]
+
+        vectors = defaultdict(dict)
+        if verbose:
+            print(f"\n{'='*70}")
+            print(title)
+            print(f"{'='*70}")
+            print(f"{'Rank':<6} {'Layer':<25} {'Step':<6} {'Strength':<12}")
+            print(f"{'-'*70}")
+
+        for rank, (strength, li, step, diff) in enumerate(top_candidates, start=1):
+            direction = diff / (diff.norm() + 1e-8)
+            vectors[li][step] = direction
+            if verbose:
+                print(f"{rank:<6} {str(li):<25} {step:<6} {strength:<12.4f}")
+
+        if verbose:
+            print(f"{'='*70}\n")
+        return dict(vectors)
+
+    # ==================================================================
+    # APPLY VECTORS
+    # ==================================================================
+    @contextmanager
+    def apply_vectors(self, vectors, beta=2.0, clip_negative=True,
+                      top_frac=None, step_range=None, clip_cap=1.0):
+        """
+        Context manager to apply steering vectors during generation.
+
+        Hook points (pincer_v2 / EPO -- STYLE):
+          - "clip_768"  -> PRE-hook on time_text_embed input (768-d, pre-SiLU).
+          - "t5_4096"   -> PRE-hook on context_embedder input (4096-d, pre-AdaLN).
+        Hook points (pincer_perstep -- OBJECT):
+          - "clip_768"        -> PRE-hook on time_text_embed input (uncapped if
+                                 clip_cap=None; needed for object unlearning).
+          - "context_embedder" -> per-step OUTPUT hook (3072-d post-projection).
+        Hook points (hybrid + legacy):
+          - "context_embedder", "time_text_embed": output hooks.
+          - "add_k_<i>", "add_q_<i>": output hooks on text-side K/Q projections.
+          - "double_<i>": output hook on attn.to_out[0] (legacy).
+
+        Args:
+            vectors: dict from learn_vectors / learn_vectors_diverse.
+            beta: float or dict {"clip": .., "t5": .., "attn": ..}.
+            clip_negative: if True, only remove positive projections.
+            top_frac: if not None and <1.0, only subtract on the top-k tokens
+                of each T5 sequence (k = int(top_frac * seq_len)). For style
+                use top_frac=None or 1.0 (diffuse signal).
+            step_range: (start, end) tuple; steering fires only when
+                start <= step < end. None means "every step".
+            clip_cap: ceiling on the *effective* CLIP β (default 1.0 — the
+                style guardrail that stops β·score exceeding the projection's
+                own magnitude). Set to None for OBJECT unlearning, where the
+                pooled-CLIP signature is multi-D and zeroing one axis just
+                slides generation to a neighbouring class — β_clip > 1 is
+                needed to push past zero into anti-concept space.
+        """
+        # Parse per-component beta
+        if isinstance(beta, dict):
+            beta_clip = beta.get("clip", 3.0)
+            beta_t5 = beta.get("t5", 5.0)
+            beta_attn = beta.get("attn", beta_t5)
+            beta_default = beta.get("default", beta_attn)
+        else:
+            beta_clip = beta
+            beta_t5 = beta
+            beta_attn = beta
+            beta_default = beta
+
+        # Step gating
+        if step_range is None:
+            def _in_range(step):
+                return True
+        else:
+            s_start, s_end = step_range
+            def _in_range(step):
+                return s_start <= step < s_end
+
+        # Top-k token gating (only meaningful for sequence tensors)
+        use_topk = top_frac is not None and top_frac < 1.0
+
+        def _apply_topk_gate(score):
+            T = score.shape[-1]
+            k = max(1, int(top_frac * T))
+            thresh = score.topk(k, dim=-1).values[..., -1:]
+            return score * (score >= thresh).to(score.dtype)
+
+        def output_hook(layer_vectors, layer_beta, token_gate=False):
+            """Output hook: subtract direction from module output.
+
+            token_gate=True enables top_frac gating on per-token scores
+            (used for the legacy T5 context_embedder output hook).
+            """
+            def hook(module, inputs, output):
+                step = self._current_step + 1
+                if step not in layer_vectors or not _in_range(step):
+                    return output
+                d = layer_vectors[step].to(output.device, output.dtype)
+                score = output @ d
+                if clip_negative:
+                    score = score.clamp(min=0.0)
+                if token_gate and use_topk and score.dim() >= 2:
+                    score = _apply_topk_gate(score)
+                update = (layer_beta * score).unsqueeze(-1) * d
+                return output - update
+            return hook
+
+        def clip_pre_hook(direction, b_clip):
+            """PRE-hook on time_text_embed. `pooled_projections` is the last
+            positional arg.
+
+            With clip_cap=1.0 (style default), the effective β is min(b_clip,
+            1.0): β·score cannot exceed the projection's own magnitude. With
+            clip_cap=None (object), no cap is applied — β > 1 then pushes
+            past zero into anti-concept space, which is required for objects
+            because the pooled-CLIP signature is multi-dimensional.
+            """
+            def hook(module, args):
+                step = self._current_step + 1
+                if not _in_range(step):
+                    return None
+                pooled = args[-1]
+                d = direction.to(pooled.device, pooled.dtype)
+                score = (pooled @ d)
+                if clip_negative:
+                    score = score.clamp(min=0.0)
+                if clip_cap is None:
+                    effective = float(b_clip) * score
+                else:
+                    effective = min(float(b_clip), float(clip_cap)) * score
+                update = effective.unsqueeze(-1) * d
+                return args[:-1] + (pooled - update,)
+            return hook
+
+        def t5_pre_hook(direction, b_t5):
+            """PRE-hook on context_embedder. Operates on raw T5 hidden
+            states (B, seq, 4096) BEFORE the Linear projection — so the
+            downstream AdaLayerNormZero in every FluxTransformerBlock
+            cannot renormalize the subtraction away."""
+            def hook(module, args):
+                step = self._current_step + 1
+                if not _in_range(step):
+                    return None
+                x = args[0]
+                d = direction.to(x.device, x.dtype)
+                score = (x @ d)
+                if clip_negative:
+                    score = score.clamp(min=0.0)
+                if use_topk:
+                    score = _apply_topk_gate(score)
+                update = (b_t5 * score).unsqueeze(-1) * d
+                return (x - update,) + args[1:]
+            return hook
+
+        try:
+            self._clear_hooks()
+            for li, step_vecs in vectors.items():
+                li_str = str(li)
+
+                if li_str == "clip_768":
+                    self._handles.append(
+                        self.target_layers["time_text_embed"].register_forward_pre_hook(
+                            clip_pre_hook(step_vecs[0], beta_clip)
+                        )
+                    )
+
+                elif li_str == "t5_4096":
+                    self._handles.append(
+                        self.target_layers["context_embedder"].register_forward_pre_hook(
+                            t5_pre_hook(step_vecs[0], beta_t5)
+                        )
+                    )
+
+                elif li_str == "context_embedder":
+                    # Per-step T5 output hook in 3072-d (post-projection).
+                    # CANONICAL path for pincer_perstep mode (object
+                    # unlearning): step_vecs is {0:v0, ..., n_steps-1:v_n}.
+                    # token_gate=True enables top_frac localisation.
+                    # Also retained for any legacy hybrid saved vectors.
+                    self._handles.append(
+                        self.target_layers["context_embedder"].register_forward_hook(
+                            output_hook(step_vecs, beta_t5, token_gate=True)
+                        )
+                    )
+
+                elif li_str == "time_text_embed":
+                    self._handles.append(
+                        self.target_layers["time_text_embed"].register_forward_hook(
+                            output_hook(step_vecs, beta_clip)
+                        )
+                    )
+
+                elif li_str.startswith("add_k_"):
+                    idx = int(li_str.split("_")[-1])
+                    if idx in self.double_add_k:
+                        self._handles.append(
+                            self.double_add_k[idx].register_forward_hook(
+                                output_hook(step_vecs, beta_attn)
+                            )
+                        )
+
+                elif li_str.startswith("add_q_"):
+                    idx = int(li_str.split("_")[-1])
+                    if idx in self.double_add_q:
+                        self._handles.append(
+                            self.double_add_q[idx].register_forward_hook(
+                                output_hook(step_vecs, beta_attn)
+                            )
+                        )
+
+                elif li_str.startswith("double_"):
+                    idx = int(li_str.split("_")[1])
+                    if idx in self.double_proj_layers:
+                        self._handles.append(
+                            self.double_proj_layers[idx].register_forward_hook(
+                                output_hook(step_vecs, beta_default)
+                            )
+                        )
+            yield
+        finally:
+            self._clear_hooks()
+
+    # ==================================================================
+    # GENERATE
+    # ==================================================================
+    def generate(self, prompt, seed, vectors=None, beta=2.0, clip_negative=True,
+                 top_frac=None, step_range=None, clip_cap=1.0):
+        """Generate image with optional steering.
+
+        Args:
+            prompt: Text prompt
+            seed: Random seed
+            vectors: Steering vectors dict
+            beta: Steering strength. Can be:
+                  - float: same beta for all layers
+                  - dict {"clip": 1.5, "t5": 3.0}: per-component beta
+                    (pincer_v2/EPO: gentle CLIP, moderate T5)
+            clip_negative: If True, only remove positive projections
+            top_frac: Top-k token gating fraction for T5 hooks (0<f<=1).
+                      Objects use ~0.15 to localize to concept tokens.
+                      Style uses 1.0 (no gating, style is diffuse).
+            step_range: Tuple (start, end) of denoising steps to steer.
+                        Objects use (0, 2) — identity is committed early.
+                        Style uses (0, N_STEPS) — style is painted throughout.
+        """
+        if vectors:
+            with self.apply_vectors(vectors, beta=beta, clip_negative=clip_negative,
+                                    top_frac=top_frac, step_range=step_range,
+                                    clip_cap=clip_cap):
+                return self._run_pipe_base(prompt, seed)
+        else:
+            return self._run_pipe_base(prompt, seed)
+
+    # ==================================================================
+    # SAVE / LOAD
+    # ==================================================================
+    def save_vectors(self, vectors, filepath):
+        save_dict = {}
+        for layer_id, step_dict in vectors.items():
+            save_dict[layer_id] = {step: t.cpu() for step, t in step_dict.items()}
+        torch.save(save_dict, filepath)
+        print(f"Saved steering vectors to: {filepath}")
+
+    def load_vectors(self, filepath):
+        save_dict = torch.load(filepath, map_location=self.device)
+        vectors = {}
+        for layer_id, step_dict in save_dict.items():
+            vectors[layer_id] = {step: t.to(self.device) for step, t in step_dict.items()}
+        print(f"Loaded steering vectors from: {filepath}")
+        return vectors
+
+print("FluxSteering class defined!")
+print("  Style unlearning:  mode='hybrid' (entry points + add_k/add_q)")
+print("  Object unlearning: mode='pincer_v2' (Entry-Point-Only: CLIP + T5)")
+print("    beta={'clip': 3.0, 't5': 5.0}")
+print("    CLIP: pre-hook on time_text_embed input (768-d, before SiLU)")
+
+# ============================================================================
+# CELL 3b: VERIFY TEXT-EMBEDDING ENTRY POINTS (run after models are loaded)
+# ============================================================================
+"""
+Empirical verification of where text embeddings first enter the FLUX transformer.
+
+Method:
+  1. Hook EVERY named module in the transformer.
+  2. Run ONE denoising step with prompt A (same seed, same timestep schedule).
+  3. Run ONE denoising step with prompt B (same seed, same timestep schedule).
+  4. Compare outputs: modules whose output CHANGED are text-dependent.
+  5. The first such modules in forward-pass order are the entry points.
+
+This proves, via code, that context_embedder and time_text_embed are the
+only places where raw text embeddings are directly consumed.
+"""
+
+def verify_text_entry_points(pipe, device="cuda", prompt_a="a dog in Van Gogh style",
+                              prompt_b="a dog in Cartoon style"):
+    """
+    Empirically identify which transformer modules are text-dependent.
+    Returns a list of (module_name, output_changed: bool) in forward-pass order.
+    """
+    import torch
+    from collections import OrderedDict
+
+    transformer = pipe.transformer
+
+    # Storage for outputs from two runs
+    outputs_a = OrderedDict()
+    outputs_b = OrderedDict()
+
+    def make_hook(storage, name):
+        def hook(module, inputs, output):
+            if isinstance(output, torch.Tensor):
+                storage[name] = output.detach().cpu().float()
+            elif isinstance(output, tuple) and len(output) > 0 and isinstance(output[0], torch.Tensor):
+                storage[name] = output[0].detach().cpu().float()
+        return hook
+
+    def run_one_step(prompt, storage):
+        """Run exactly 1 denoising step with hooks on all modules."""
+        handles = []
+        try:
+            for name, mod in transformer.named_modules():
+                if name == "":  # skip root
+                    continue
+                handles.append(mod.register_forward_hook(make_hook(storage, name)))
+
+            g = torch.Generator(device=device).manual_seed(42)
+            pipe(
+                prompt=prompt,
+                num_inference_steps=1,
+                generator=g,
+                output_type="latent",
+            )
+        finally:
+            for h in handles:
+                h.remove()
+
+    print("="*80)
+    print("VERIFYING TEXT-EMBEDDING ENTRY POINTS")
+    print("="*80)
+    print(f"  Prompt A: \"{prompt_a}\"")
+    print(f"  Prompt B: \"{prompt_b}\"")
+    print(f"  Same seed (42), same scheduler, 1 step each")
+    print()
+
+    # Run both prompts
+    print("Running prompt A...")
+    run_one_step(prompt_a, outputs_a)
+    print("Running prompt B...")
+    run_one_step(prompt_b, outputs_b)
+
+    # Compare outputs
+    common = [n for n in outputs_a if n in outputs_b]
+    text_dependent = []
+    text_independent = []
+
+    for name in common:
+        a, b = outputs_a[name], outputs_b[name]
+        if a.shape == b.shape:
+            diff = (a - b).abs().max().item()
+            changed = diff > 1e-6
+        else:
+            changed = True
+            diff = float("inf")
+
+        if changed:
+            text_dependent.append((name, diff))
+        else:
+            text_independent.append(name)
+
+    # Print results
+    print(f"\n{'='*80}")
+    print(f"RESULTS: {len(text_dependent)} text-dependent modules (out of {len(common)} total)")
+    print(f"{'='*80}")
+
+    print(f"\n--- TEXT-INDEPENDENT modules (output identical for both prompts): ---")
+    if text_independent:
+        for n in text_independent[:10]:
+            print(f"  {n}")
+        if len(text_independent) > 10:
+            print(f"  ... and {len(text_independent) - 10} more")
+    else:
+        print("  (none — all modules are text-dependent)")
+
+    print(f"\n--- TEXT-DEPENDENT modules (output changed between prompts): ---")
+    # Sort by max diff to highlight strongest
+    text_dependent.sort(key=lambda x: -x[1])
+    for name, diff in text_dependent:
+        marker = ""
+        if name in ("context_embedder", "time_text_embed"):
+            marker = "  ◀ TEXT ENTRY POINT"
+        elif name.startswith("context_embedder.") or name.startswith("time_text_embed."):
+            marker = "  (sub-module of entry point)"
+        print(f"  {name:<60} max_diff={diff:.6f}{marker}")
+
+    # Identify true entry points: text-dependent modules that are NOT children
+    # of other text-dependent modules (i.e., the roots of text-dependent subtrees)
+    dep_names = set(n for n, _ in text_dependent)
+    entry_points = []
+    for name, diff in text_dependent:
+        # Check if any proper parent is also text-dependent
+        parts = name.split(".")
+        is_child = False
+        for i in range(1, len(parts)):
+            parent = ".".join(parts[:i])
+            if parent in dep_names:
+                is_child = True
+                break
+        if not is_child:
+            entry_points.append(name)
+
+    print(f"\n{'='*80}")
+    print(f"ENTRY POINTS (root text-dependent modules):")
+    print(f"{'='*80}")
+    for ep in entry_points:
+        mod = dict(transformer.named_modules())[ep]
+        print(f"  transformer.{ep}")
+        print(f"    type: {mod.__class__.__name__}")
+        # Print shape info if it's a Linear layer
+        if hasattr(mod, 'in_features'):
+            print(f"    shape: Linear({mod.in_features} → {mod.out_features})")
+    print(f"{'='*80}\n")
+
+    return entry_points, text_dependent, text_independent
+
+# NOTE: Run this AFTER Cell 6 (model loading). Uncomment and execute:
+# entry_points, dep, indep = verify_text_entry_points(pipe, device=DEVICE)
+
+print("✓ verify_text_entry_points() defined. Run it after loading models.")
+
+# ============================================================================
+# CELL 4: QUALITY METRICS (FID, CLIP Score)
+# ============================================================================
+"""
+Quality metrics following UnlearnCanvas evaluation protocol.
+"""
+
+class QualityMetrics:
+    """Calculate image quality metrics for UnlearnCanvas evaluation."""
+
+    def __init__(self, device="cuda"):
+        self.device = device
+        print("Loading quality metric models...")
+
+        # Load CLIP for text-image alignment
+        try:
+            self.clip_model, self.clip_preprocess = clip.load("ViT-L/14", device=device)
+            self.clip_model.eval()
+            print("  ✓ CLIP ViT-L/14 loaded")
+        except Exception as e:
+            print(f"  ✗ CLIP loading failed: {e}")
+            self.clip_model = None
+
+    def calculate_clip_score(self, images, prompts):
+        """
+        Calculate CLIP score between images and text prompts.
+        Higher = better text-image alignment.
+        """
+        if self.clip_model is None:
+            return None
+
+        scores = []
+        with torch.no_grad():
+            for img, prompt in zip(images, prompts):
+                image_input = self.clip_preprocess(img).unsqueeze(0).to(self.device)
+                text_input = clip.tokenize([prompt], truncate=True).to(self.device)
+
+                image_features = self.clip_model.encode_image(image_input)
+                text_features = self.clip_model.encode_text(text_input)
+
+                image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+                similarity = (image_features @ text_features.T).item()
+                scores.append(similarity)
+
+        return np.mean(scores)
+
+    def calculate_fid(self, real_path, generated_path):
+        """
+        Calculate FID between two image directories.
+        Lower = better (generated images closer to real distribution).
+        """
+        try:
+            score = fid.compute_fid(
+                real_path,
+                generated_path,
+                mode="clean",
+                num_workers=0,
+                batch_size=8,
+                device=torch.device(self.device)
+            )
+            return score
+        except Exception as e:
+            print(f"⚠ FID calculation error: {e}")
+            return None
+
+print("✓ QualityMetrics class defined!")
+
+# ============================================================================
+# CELL 4B: LLAVA CLASSIFIER (Alternative to CLIP - More Accurate)
+# ============================================================================
+"""
+LLaVA-based classification for more accurate style/object recognition.
+
+Pros:
+- More nuanced understanding of artistic styles
+- Can handle ambiguous cases better
+- Similar to human judgment
+
+Cons:
+- Slower (~2-5s per image vs 0.1s for CLIP)
+- Requires more VRAM (~14GB additional)
+
+Usage:
+  Set USE_LLAVA = True in the configuration cell to use LLaVA instead of CLIP.
+"""
+
+from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration
+
+class LLaVAClassifier:
+    """
+    LLaVA-based image classifier for UnlearnCanvas evaluation.
+
+    This implementation follows the EXACT methodology from the TRACE paper
+    (Appendix E.4, Figures 6-7), which uses numbered options and expects
+    the model to respond with ONLY a number for reliable parsing.
+
+    Reference: TRACE: Transcoder-based Concept Editing (ICLR 2026)
+    """
+
+    def __init__(self, model_id="llava-hf/llava-v1.6-vicuna-7b-hf", device="cuda"):
+        self.device = device
+        self.model_id = model_id
+        self.model = None
+        self.processor = None
+
+    def load(self):
+        """Load LLaVA model (call separately to manage VRAM)."""
+        if self.model is not None:
+            return
+
+        print(f"Loading LLaVA: {self.model_id}...")
+        self.processor = LlavaNextProcessor.from_pretrained(self.model_id)
+        self.model = LlavaNextForConditionalGeneration.from_pretrained(
+            self.model_id,
+            torch_dtype=torch.float16,
+            device_map="auto"
+        )
+        print("✓ LLaVA loaded!")
+
+    def unload(self):
+        """Unload model to free VRAM."""
+        if self.model is not None:
+            del self.model
+            del self.processor
+            self.model = None
+            self.processor = None
+            gc.collect()
+            torch.cuda.empty_cache()
+            print("✓ LLaVA unloaded")
+
+    def _generate_response(self, image, prompt):
+        """Generate response from LLaVA given image and prompt."""
+        if self.model is None:
+            self.load()
+
+        # Load image if path provided, ensure RGB
+        if isinstance(image, str):
+            image = Image.open(image).convert("RGB")
+        elif isinstance(image, Image.Image):
+            image = image.convert("RGB")
+
+        # Format for LLaVA
+        conversation = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": prompt}
+                ]
+            }
+        ]
+
+        prompt_formatted = self.processor.apply_chat_template(
+            conversation, add_generation_prompt=True
+        )
+
+        inputs = self.processor(images=image, text=prompt_formatted, return_tensors="pt").to(self.device)
+
+        with torch.no_grad():
+            output = self.model.generate(
+                **inputs,
+                max_new_tokens=10,  # Only need a number
+                do_sample=False
+            )
+
+        # Decode only the generated part
+        response = self.processor.decode(output[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
+        return response.strip()
+
+    def _parse_number_response(self, response, max_options):
+        """
+        Parse a number from LLaVA response.
+        Returns 0-indexed class index or None if invalid.
+        """
+        # Try to extract a number from the response
+        import re
+        numbers = re.findall(r'\d+', response)
+        if numbers:
+            num = int(numbers[0])
+            if 1 <= num <= max_options:
+                return num - 1  # Convert to 0-indexed
+        return None
+
+    def classify_style(self, image, styles=None, debug=False):
+        """
+        Classify image style using TRACE paper's exact prompt format.
+
+        From TRACE paper Figure 6:
+        'You are an image classifier. Classify the artistic style of the given image.
+         Instruction: Choose exactly one option from the numbered list below.
+         Respond with only the number.'
+        """
+        styles = styles or STYLES
+
+        # Build numbered options list (TRACE paper format)
+        options_list = '\n'.join([f"{i+1}. {s.replace('_', ' ')}" for i, s in enumerate(styles)])
+
+        prompt = (
+            "You are an image classifier. Classify the artistic style of the given image.\n"
+            "Instruction: Choose exactly one option from the numbered list below. "
+            "Respond with only the number.\n"
+            f"Options:\n{options_list}"
+        )
+
+        response = self._generate_response(image, prompt)
+
+        if debug:
+            print(f"LLaVA style response: '{response}'")
+
+        idx = self._parse_number_response(response, len(styles))
+        if idx is not None:
+            return styles[idx]
+
+        # Fallback: try to match style name in response
+        response_lower = response.lower()
+        for style in styles:
+            if style.lower().replace('_', ' ') in response_lower:
+                return style
+
+        return None
+
+    def classify_object(self, image, objects=None, debug=False):
+        """
+        Classify image object using TRACE paper's exact prompt format.
+
+        From TRACE paper Figure 7:
+        'Classify the object depicted in this image.
+         Choose exactly one option from the numbered list.
+         Respond with only the number.'
+        """
+        objects = objects or OBJECTS
+
+        # Build numbered options list (TRACE paper format)
+        options_list = '\n'.join([f"{i+1}. {o.replace('_', ' ')}" for i, o in enumerate(objects)])
+
+        prompt = (
+            "Classify the object depicted in this image.\n"
+            "Choose exactly one option from the numbered list.\n"
+            "Respond with only the number.\n"
+            f"Object categories:\n{options_list}"
+        )
+
+        response = self._generate_response(image, prompt)
+
+        if debug:
+            print(f"LLaVA object response: '{response}'")
+
+        idx = self._parse_number_response(response, len(objects))
+        if idx is not None:
+            return objects[idx]
+
+        # Fallback: try to match object name in response
+        response_lower = response.lower()
+        for obj in objects:
+            if obj.lower().replace('_', ' ') in response_lower:
+                return obj
+
+        return None
+
+print("✓ LLaVAClassifier class defined (TRACE paper format)!")
+
+# ============================================================================
+# CELL 5: UNLEARNCANVAS EVALUATOR (Supports both CLIP and LLaVA)
+# ============================================================================
+"""
+UnlearnCanvas-style evaluation with configurable classifier.
+
+Classifier Options:
+- CLIP: Fast zero-shot classification (~0.1s/image)
+- LLaVA: More accurate VLM-based classification (~2-5s/image)
+
+Set USE_LLAVA = True to use LLaVA, False for CLIP.
+"""
+
+# ==========================================================================
+# CLASSIFIER CONFIGURATION - CHANGE THIS
+# ==========================================================================
+USE_LLAVA = True  # True = LLaVA (more accurate), False = CLIP (faster)
+
+class UnlearnCanvasEvaluator:
+    """
+    Evaluate unlearning performance using UnlearnCanvas metrics.
+
+    Supports both CLIP (fast) and LLaVA (accurate) classification.
+
+    Metrics:
+    - UA (Unlearning Accuracy): 1 - accuracy on target concept
+    - IRA (In-domain Retain Accuracy): accuracy on same-domain concepts
+    - CRA (Cross-domain Retain Accuracy): accuracy on other-domain concepts
+    """
+
+    def __init__(self, device="cuda", use_llava=None):
+        self.device = device
+        self.use_llava = use_llava if use_llava is not None else USE_LLAVA
+
+        print(f"Initializing UnlearnCanvas Evaluator (classifier: {'LLaVA' if self.use_llava else 'CLIP'})...")
+
+        if self.use_llava:
+            self.llava = LLaVAClassifier(device=device)
+            print("  → LLaVA classifier selected (will load on first use)")
+        else:
+            self.llava = None
+            print("  → CLIP classifier selected (fast mode)")
+
+        # Load CLIP (also needed for CLIP Score metric)
+        self.clip_model, self.clip_preprocess = clip.load("ViT-L/14", device=device)
+        self.clip_model.eval()
+
+        # Pre-compute text embeddings only for CLIP classifier mode
+        if not self.use_llava:
+            self._precompute_text_embeddings()
+        print("✓ UnlearnCanvas Evaluator ready!")
+
+    def _precompute_text_embeddings(self):
+        """Pre-compute CLIP text embeddings for all styles and objects."""
+        with torch.no_grad():
+            # Style embeddings
+            style_texts = [f"A painting in {s.replace('_', ' ')} style" for s in STYLES]
+            style_tokens = clip.tokenize(style_texts).to(self.device)
+            self.style_embeddings = self.clip_model.encode_text(style_tokens)
+            self.style_embeddings = self.style_embeddings / self.style_embeddings.norm(dim=-1, keepdim=True)
+
+            # Object embeddings
+            object_texts = [f"A painting of {o.replace('_', ' ')}" for o in OBJECTS]
+            object_tokens = clip.tokenize(object_texts).to(self.device)
+            self.object_embeddings = self.clip_model.encode_text(object_tokens)
+            self.object_embeddings = self.object_embeddings / self.object_embeddings.norm(dim=-1, keepdim=True)
+
+    def classify_image(self, image, domain="style"):
+        """
+        Classify an image into style or object category.
+        Uses LLaVA if configured, otherwise CLIP.
+
+        Args:
+            image: PIL Image
+            domain: "style" or "object"
+
+        Returns:
+            Predicted class name
+        """
+        # Use LLaVA if configured
+        if self.use_llava and self.llava is not None:
+            if domain == "style":
+                result = self.llava.classify_style(image)
+            else:
+                result = self.llava.classify_object(image)
+            # Return if valid, otherwise fallback to CLIP
+            if result is not None:
+                return result
+
+        # CLIP classification (default or fallback)
+        if not hasattr(self, 'style_embeddings'):
+            self._precompute_text_embeddings()
+
+        with torch.no_grad():
+            image_input = self.clip_preprocess(image).unsqueeze(0).to(self.device)
+            image_features = self.clip_model.encode_image(image_input)
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+            if domain == "style":
+                similarities = (image_features @ self.style_embeddings.T).squeeze(0)
+                pred_idx = similarities.argmax().item()
+                return STYLES[pred_idx]
+            else:
+                similarities = (image_features @ self.object_embeddings.T).squeeze(0)
+                pred_idx = similarities.argmax().item()
+                return OBJECTS[pred_idx]
+
+    def evaluate_unlearning(
+        self,
+        steerer,
+        vectors,
+        target_concept,
+        target_type="style",
+        beta=2.0,
+        clip_negative=True,
+        top_frac=None,
+        step_range=None,
+        clip_cap=1.0,
+        eval_seeds=None,
+        save_images=True,
+        output_dir=None,
+        generate_baselines=True
+    ):
+        """
+        Evaluate unlearning performance following UnlearnCanvas protocol.
+
+        TWO-PHASE approach to manage VRAM:
+          Phase 1: Generate ALL images with FLUX (steerer) and save to disk.
+                   Skips images that already exist (resume support).
+          Phase 2: Unload FLUX from VRAM, load LLaVA, classify all saved
+                   images from disk to compute UA, IRA, CRA.
+
+        Full grid: ALL styles x ALL objects x ALL eval seeds.
+        """
+        eval_seeds = eval_seeds or EVAL_SEEDS
+        output_dir = output_dir or os.path.join(STEERED_DIR, f"{target_concept}_{steerer.mode}")
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Baseline dir for comparison images (without steering)
+        baseline_dir = os.path.join(BASELINE_DIR, target_concept)
+        if generate_baselines:
+            os.makedirs(baseline_dir, exist_ok=True)
+
+        print(f"\n{'='*70}")
+        print(f"EVALUATING UNLEARNING: {target_concept} ({target_type})")
+        print(f"{'='*70}")
+
+        # Build full grid of test cases
+        test_cases = []
+        for style in STYLES:
+            for obj in OBJECTS:
+                for seed in eval_seeds:
+                    filename = f"{style}_{obj}_seed{seed}.jpg"
+                    prompt = f"A {obj.replace('_', ' ')} image in {style.replace('_', ' ')} style."
+                    test_cases.append({
+                        "prompt": prompt,
+                        "seed": seed,
+                        "gt_style": style,
+                        "gt_object": obj,
+                        "filename": filename,
+                    })
+
+        total_images = len(test_cases)
+
+        # ==============================================================
+        # PHASE 1: Generate all images with FLUX (with resume support)
+        # ==============================================================
+        skipped = 0
+        generated = 0
+        print(f"\n--- PHASE 1: IMAGE GENERATION ---")
+        print(f"Grid: {len(STYLES)} styles x {len(OBJECTS)} objects x {len(eval_seeds)} seeds = {total_images} images")
+        print(f"Steering: beta={beta}, top_frac={top_frac}, step_range={step_range}, clip_cap={clip_cap}")
+        print(f"Output: {output_dir}")
+
+        for i, case in enumerate(tqdm(test_cases, desc="Phase 1: Generating")):
+            save_path = os.path.join(output_dir, case["filename"])
+
+            # Resume support: skip if image already exists
+            if os.path.exists(save_path):
+                skipped += 1
+                continue
+
+            img = steerer.generate(
+                case["prompt"],
+                case["seed"],
+                vectors=vectors,
+                beta=beta,
+                clip_negative=clip_negative,
+                top_frac=top_frac,
+                step_range=step_range,
+                clip_cap=clip_cap,
+            )
+            img.save(save_path)
+            generated += 1
+
+        print(f"Phase 1 done: {generated} generated, {skipped} skipped (already existed)")
+
+        # Generate baseline comparison images (without steering)
+        if generate_baselines:
+            print("Generating baseline images (no steering) for comparison...")
+            sample_configs = []
+            if target_type == "style":
+                sample_configs = [
+                    (target_concept, "Dog"), (target_concept, "Cat"), (target_concept, "Bird")
+                ]
+            else:
+                sample_configs = [
+                    ("Van_Gogh", target_concept), ("Cartoon", target_concept), ("Pop_Art", target_concept)
+                ]
+            for s, o in sample_configs:
+                fname = f"{s}_{o}_seed{eval_seeds[0]}.jpg"
+                base_path = os.path.join(baseline_dir, fname)
+                if not os.path.exists(base_path):
+                    prompt = f"A {o.replace('_', ' ')} image in {s.replace('_', ' ')} style."
+                    img_base = steerer.generate(prompt, seed=eval_seeds[0], vectors=None)
+                    img_base.save(base_path)
+
+        # ==============================================================
+        # FREE FLUX VRAM before loading LLaVA
+        # ==============================================================
+        print("\nFreeing FLUX VRAM before classification phase...")
+        steerer.pipe.to('cpu')
+        gc.collect()
+        torch.cuda.empty_cache()
+        print("FLUX moved to CPU. VRAM freed for LLaVA.")
+
+        # ==============================================================
+        # PHASE 2: Classify all saved images from disk
+        # ==============================================================
+        print(f"\n--- PHASE 2: CLASSIFICATION ({total_images} images) ---")
+
+        results = {
+            "target_correct": 0, "target_total": 0,
+            "ira_correct": 0, "ira_total": 0,
+            "cra_correct": 0, "cra_total": 0,
+            "prompts": []
+        }
+
+        for i, case in enumerate(tqdm(test_cases, desc="Phase 2: Classifying")):
+            img_path = os.path.join(output_dir, case["filename"])
+
+            if not os.path.exists(img_path):
+                print(f"  WARNING: Missing image {case['filename']}, skipping")
+                continue
+
+            # Load image from disk (not keeping in RAM)
+            img = Image.open(img_path).convert("RGB")
+            results["prompts"].append(case["prompt"])
+
+            gt_style = case["gt_style"]
+            gt_object = case["gt_object"]
+
+            if target_type == "style":
+                pred_style = self.classify_image(img, domain="style")
+                pred_object = self.classify_image(img, domain="object")
+
+                # UA: images whose prompt IS the target style
+                if gt_style == target_concept:
+                    results["target_total"] += 1
+                    if pred_style == target_concept:
+                        results["target_correct"] += 1
+                # IRA: other styles in same domain
+                else:
+                    results["ira_total"] += 1
+                    if pred_style == gt_style:
+                        results["ira_correct"] += 1
+
+                # CRA: object accuracy across ALL images
+                results["cra_total"] += 1
+                if pred_object == gt_object:
+                    results["cra_correct"] += 1
+
+            else:  # target_type == "object"
+                pred_object = self.classify_image(img, domain="object")
+                pred_style = self.classify_image(img, domain="style")
+
+                if gt_object == target_concept:
+                    results["target_total"] += 1
+                    if pred_object == target_concept:
+                        results["target_correct"] += 1
+                else:
+                    results["ira_total"] += 1
+                    if pred_object == gt_object:
+                        results["ira_correct"] += 1
+
+                results["cra_total"] += 1
+                if pred_style == gt_style:
+                    results["cra_correct"] += 1
+
+            # Progress log every 50 images
+            if (i + 1) % 50 == 0:
+                _ua = 1.0 - (results["target_correct"] / max(results["target_total"], 1))
+                _ira = results["ira_correct"] / max(results["ira_total"], 1)
+                _cra = results["cra_correct"] / max(results["cra_total"], 1)
+                print(f"  [{i+1}/{total_images}] Running UA={_ua:.1%} IRA={_ira:.1%} CRA={_cra:.1%}")
+
+        # ==============================================================
+        # PHASE 2 DONE: Unload LLaVA, reload FLUX back to GPU
+        # ==============================================================
+        print("\nClassification done. Unloading LLaVA, reloading FLUX to GPU...")
+        if self.use_llava and self.llava is not None:
+            self.llava.unload()
+        steerer.pipe.to(steerer.device)
+        gc.collect()
+        torch.cuda.empty_cache()
+        print("FLUX reloaded to GPU.")
+
+        # ==============================================================
+        # Calculate final metrics
+        # ==============================================================
+        ua = 1.0 - (results["target_correct"] / max(results["target_total"], 1))
+        ira = results["ira_correct"] / max(results["ira_total"], 1)
+        cra = results["cra_correct"] / max(results["cra_total"], 1)
+
+        print(f"\n{'='*70}")
+        print(f"FINAL RESULTS: {target_concept}")
+        print(f"{'='*70}")
+        print(f"UA  (Unlearning Accuracy):     {ua:.2%}  ({results['target_total'] - results['target_correct']}/{results['target_total']} not classified as target)")
+        print(f"IRA (In-Domain Retain):        {ira:.2%}  ({results['ira_correct']}/{results['ira_total']} correct in same domain)")
+        print(f"CRA (Cross-Domain Retain):     {cra:.2%}  ({results['cra_correct']}/{results['cra_total']} correct in cross domain)")
+        print(f"Total images:                  {total_images}")
+        print(f"{'='*70}")
+
+        return {
+            "UA": ua,
+            "IRA": ira,
+            "CRA": cra,
+            "target_concept": target_concept,
+            "target_type": target_type,
+            "beta": beta,
+            "n_images": total_images,
+            "prompts": results["prompts"]
+        }
+
+print("✓ UnlearnCanvasEvaluator class defined!")
+
+# ============================================================================
+# CELL 6: LOAD MODELS
+# ============================================================================
+
+print("="*70)
+print("LOADING MODELS")
+print("="*70)
+
+# HuggingFace login (for gated models)
+try:
+    from google.colab import userdata
+    from huggingface_hub import login
+    hf_token = userdata.get("hf_token")
+    login(hf_token)
+    print("✓ HuggingFace authenticated")
+except:
+    hf_token = None
+    print("⚠ No HuggingFace token found, some models may not load")
+
+# Load FLUX pipeline
+print(f"\nLoading FLUX pipeline: {MODEL_ID}...")
+pipe = FluxPipeline.from_pretrained(
+    MODEL_ID,
+    token=hf_token,
+    torch_dtype=torch.bfloat16
+).to(DEVICE)
+print("✓ FLUX pipeline loaded")
+
+# Initialize FluxSteering
+# TARGET_CONCEPT / TARGET_TYPE are defined here so STEERING_MODE can be
+# auto-selected. The full experiment block (BETA / TOP_FRAC / STEP_RANGE /
+# CLIP_CAP) lives further down -- the values below are the canonical ones.
+TARGET_CONCEPT = "Dog"        # Concept to unlearn (e.g., "Dog", "Van_Gogh")
+TARGET_TYPE = "object"        # "style" or "object"
+
+# Mode selection:
+#   STYLE  -> "pincer_v2"      (direct CLIP + direct T5 4096-d pre-hooks)
+#   OBJECT -> "pincer_perstep" (direct CLIP, no cap, + per-step T5 3072-d
+#                               output hook learned via pipeline runs)
+#   "hybrid" retained for backward compat with old saved vectors only.
+if TARGET_TYPE == "style":
+    STEERING_MODE = "pincer_v2"
+else:
+    STEERING_MODE = "pincer_perstep"
+
+print(f"\nInitializing FluxSteering (mode={STEERING_MODE})...")
+steerer = FluxSteering(pipe, device=DEVICE, n_steps=N_STEPS, mode=STEERING_MODE)
+
+# Initialize evaluators
+print("\nInitializing evaluators...")
+evaluator = UnlearnCanvasEvaluator(device=DEVICE)
+quality_metrics = QualityMetrics(device=DEVICE)
+
+print("\n" + "="*70)
+print("✓ ALL MODELS LOADED SUCCESSFULLY!")
+print("="*70)
+
+# ============================================================================
+# CELL 7: EXPERIMENT CONFIGURATION
+# ============================================================================
+"""
+Configure which concept to unlearn.
+Change TARGET_CONCEPT and TARGET_TYPE for different experiments.
+"""
+
+# ==========================================================================
+# EXPERIMENT CONFIGURATION
+# TARGET_CONCEPT and TARGET_TYPE are defined above (before FluxSteering
+# init) so STEERING_MODE can be auto-selected from TARGET_TYPE. To change
+# the experiment, edit the values up there.
+# ==========================================================================
+#   STYLE  (pincer_v2)      -- direct CLIP + direct T5 4096-d pre-hooks.
+#                              CLIP_CAP=1.0 (style guardrail). top_frac=1.0
+#                              and step_range covers all steps; style is
+#                              diffuse and painted throughout denoising.
+#     BETA = {"clip": 0.0, "t5": 2.0}, CLIP_CAP = 1.0
+#
+#   OBJECT (pincer_perstep) -- direct CLIP, NO cap, + per-step T5 3072-d
+#                              output hook. CLIP_CAP=None lets beta_clip>1
+#                              push past zero; per-step T5 tracks the
+#                              timestep-specific operating point.
+#     BETA = {"clip": 3.0, "t5": 5.0}, CLIP_CAP = None
+if TARGET_TYPE == "style":
+    BETA = {"clip": 0.0, "t5": 2.0}
+    TOP_FRAC = 1.0
+    STEP_RANGE = (0, N_STEPS)
+    CLIP_CAP = 1.0
+else:
+    BETA = {"clip": 3.0, "t5": 5.0}
+    TOP_FRAC = None
+    STEP_RANGE = (0, N_STEPS)
+    CLIP_CAP = None
+
+# ==========================================================================
+# Automatic configuration
+# ==========================================================================
+# Include mode in output dir to prevent cross-mode caching!
+OUTPUT_DIR = os.path.join(RESULTS_DIR, f"{TARGET_CONCEPT}_{STEERING_MODE}")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ---- PROMPT CONFIGURATION ----
+# All object modes now use diverse CASteer-style prompt pairs.
+# The 50 diverse contexts cancel out, isolating the target concept direction.
+# This is CRITICAL for objects: ensures the vector captures "Dog" specifically,
+# not "general content" or "things about this particular scene."
+if TARGET_TYPE == "style":
+    DIVERSE_PROMPT_PAIRS = make_style_prompts(TARGET_CONCEPT.replace('_', ' '), NUM_DIVERSE_PROMPTS)
+    pos_prompt = f"{TARGET_CONCEPT.replace('_', ' ')} style"
+    neg_prompt = "neutral style"
+else:
+    DIVERSE_PROMPT_PAIRS = make_object_prompts(TARGET_CONCEPT.replace('_', ' '), NUM_DIVERSE_PROMPTS)
+    pos_prompt = f"{TARGET_CONCEPT.replace('_', ' ')}"
+    neg_prompt = "Object"
+
+print("="*70)
+print("EXPERIMENT CONFIGURATION")
+print("="*70)
+print(f"Target Concept:    {TARGET_CONCEPT}")
+print(f"Target Type:       {TARGET_TYPE}")
+print(f"Steering Mode:     {STEERING_MODE}")
+print(f"Steering Strength: \u03b2 = {BETA}")
+print(f"Top-k gating:      top_frac = {TOP_FRAC}")
+print(f"Step range:        {STEP_RANGE}")
+print(f"CLIP cap:          clip_cap = {CLIP_CAP}")
+if TARGET_TYPE == "object":
+    print(f"Prompt Strategy:   {len(DIVERSE_PROMPT_PAIRS)} diverse pairs (CASteer methodology)")
+    print(f"  Example pos:     '{DIVERSE_PROMPT_PAIRS[0][0]}'")
+    print(f"  Example neg:     '{DIVERSE_PROMPT_PAIRS[0][1]}'")
+    print(f"  Recipe:          pincer_perstep -- direct CLIP 768-d (no cap) +")
+    print(f"                   per-step T5 3072-d output hook on context_embedder.")
+    print(f"                   clip={BETA.get('clip', 'N/A')}, t5={BETA.get('t5', 'N/A')}")
+else:
+    print(f"Prompt Strategy:   {len(DIVERSE_PROMPT_PAIRS)} diverse pairs")
+    print(f"  Example pos:     '{DIVERSE_PROMPT_PAIRS[0][0]}'")
+    print(f"  Example neg:     '{DIVERSE_PROMPT_PAIRS[0][1]}'")
+    print(f"  Recipe:          pincer_v2 -- direct CLIP 768-d (cap=1.0) +")
+    print(f"                   direct T5 4096-d pre-hook on context_embedder INPUT.")
+    print(f"                   clip={BETA.get('clip', 'N/A')}, t5={BETA.get('t5', 'N/A')}")
+print(f"Eval Seeds:        {len(EVAL_SEEDS)}")
+print(f"Output Directory:  {OUTPUT_DIR}")
+print("="*70)
+
+# ============================================================================
+# CELL 8: LEARN STEERING VECTORS
+# ============================================================================
+
+print(f"Learning steering vectors for: {TARGET_CONCEPT}")
+print(f"Mode: {STEERING_MODE}")
+
+# ===========================================================================
+# HYBRID mode: uses learn_vectors (single pos/neg pair + multiple seeds).
+#   This calls _learn_hybrid which hooks context_embedder + time_text_embed
+#   + add_k_proj + add_q_proj with mask-aware pooling across multiple seeds.
+#   This is the proven approach for STYLE unlearning.
+#
+# PINCER_V2 mode: uses learn_vectors_diverse (CASteer methodology).
+#   50 diverse contexts with the SAME seed. Averaging cancels context-
+#   specific noise, isolating the target concept. Best for OBJECT unlearning.
+# ===========================================================================
+if STEERING_MODE == "hybrid":
+    # Hybrid mode: single prompt pair, multiple seeds (TRACE methodology)
+    print(f"Using single prompt pair with {len(LEARNING_SEEDS)} seeds (TRACE methodology)")
+    print(f"  Positive: '{pos_prompt}'")
+    print(f"  Negative: '{neg_prompt}'\n")
+    vectors = steerer.learn_vectors(
+        pos_prompt=pos_prompt,
+        neg_prompt=neg_prompt,
+        seeds=LEARNING_SEEDS,
+        top_k=TOP_K_VECTORS,
+        verbose=True
+    )
+    vector_path = os.path.join(VECTOR_DIR, f"{TARGET_CONCEPT}_{STEERING_MODE}_vectors.pt")
+else:
+    # pincer_v2 (style) and pincer_perstep (object): both use diverse pairs.
+    # learn_vectors_diverse dispatches on self.mode internally.
+    print(f"Using {len(DIVERSE_PROMPT_PAIRS)} diverse prompt pairs (CASteer methodology)")
+    print(f"  Example: '{DIVERSE_PROMPT_PAIRS[0][0]}' vs '{DIVERSE_PROMPT_PAIRS[0][1]}'\n")
+    vectors = steerer.learn_vectors_diverse(
+        prompt_pairs=DIVERSE_PROMPT_PAIRS,
+        seed=0,
+        top_k=TOP_K_VECTORS,
+        verbose=True
+    )
+    vector_path = os.path.join(VECTOR_DIR, f"{TARGET_CONCEPT}_{STEERING_MODE}_diverse_vectors.pt")
+
+# Save vectors for reproducibility
+steerer.save_vectors(vectors, vector_path)
+
+# ============================================================================
+# CELL 8B: QUICK STEERING TEST — Run BEFORE full evaluation!
+# ============================================================================
+"""
+Tests steering with multiple beta values + clip_negative settings.
+Generates 6 images total — takes ~30 seconds. Shows immediate visual results.
+
+KEY: If ALL images look identical to baseline, there's a fundamental issue.
+     If higher beta or clip_negative=False produces different images, we have
+     the right settings. Then run the full evaluation.
+"""
+
+import numpy as np
+
+DIAG_PROMPT = f"A {TARGET_CONCEPT.replace('_', ' ')} in a park."
+DIAG_SEED = 42
+
+print("="*70)
+print(f"QUICK STEERING TEST: {TARGET_CONCEPT} ({STEERING_MODE})")
+print("="*70)
+print(f"Prompt: '{DIAG_PROMPT}'")
+print(f"Vectors: {len(vectors)} layers, "
+      f"{sum(len(v) for v in vectors.values())} (layer,step) pairs\n")
+
+# --- Test 0a: Zero context_embedder (T5) - should have minimal effect ---
+print("TEST 0a: Zero context_embedder (T5) - expect minimal change...")
+_handle_t5 = steerer.target_layers["context_embedder"].register_forward_hook(
+    lambda m, i, o: o * 0
+)
+t5_zeroed_img = steerer._run_pipe_base(DIAG_PROMPT, DIAG_SEED)
+_handle_t5.remove()
+
+# --- Test 0b: Zero time_text_embed (CLIP) - should produce noise ---
+print("TEST 0b: Zero time_text_embed (CLIP) - expect pure noise...")
+_handle_clip = steerer.target_layers["time_text_embed"].register_forward_hook(
+    lambda m, i, o: o * 0
+)
+clip_zeroed_img = steerer._run_pipe_base(DIAG_PROMPT, DIAG_SEED)
+_handle_clip.remove()
+
+# --- Generate baseline ---
+print("\nGenerating baseline (no steering)...")
+baseline_img = steerer.generate(DIAG_PROMPT, DIAG_SEED, vectors=None)
+
+# --- Test configurations ---
+# Object  sweep (pincer_perstep): per-component beta with NO clip cap.
+# Style   sweep (pincer_v2):      vary t5 (style is diffuse), CLIP_CAP=1.0.
+if STEERING_MODE == "pincer_perstep":
+    configs = [
+        ("clip=3,t5=3", {"clip": 3.0, "t5": 3.0}, False, None, (0, N_STEPS), None),
+        ("clip=3,t5=5", {"clip": 3.0, "t5": 5.0}, False, None, (0, N_STEPS), None),
+        ("clip=5,t5=5", {"clip": 5.0, "t5": 5.0}, False, None, (0, N_STEPS), None),
+        ("clip=3,t5=8", {"clip": 3.0, "t5": 8.0}, False, None, (0, N_STEPS), None),
+        ("clip=5,t5=8", {"clip": 5.0, "t5": 8.0}, False, None, (0, N_STEPS), None),
+    ]
+elif STEERING_MODE == "pincer_v2":
+    configs = [
+        ("clip=0,t5=1", {"clip": 0.0, "t5": 1.0}, True, 1.0, (0, N_STEPS), 1.0),
+        ("clip=0,t5=2", {"clip": 0.0, "t5": 2.0}, True, 1.0, (0, N_STEPS), 1.0),
+        ("clip=0,t5=3", {"clip": 0.0, "t5": 3.0}, True, 1.0, (0, N_STEPS), 1.0),
+        ("clip=0,t5=4", {"clip": 0.0, "t5": 4.0}, True, 1.0, (0, N_STEPS), 1.0),
+        ("clip=0,t5=2, steps=(0,2)", {"clip": 0.0, "t5": 2.0}, True, 1.0, (0, 2), 1.0),
+    ]
+else:
+    # Legacy hybrid path — scalar beta sweep.
+    configs = [
+        ("β=0, clip_neg=True",  0.0, True, None, None, 1.0),
+        ("β=1, clip_neg=True",  1.0, True, None, None, 1.0),
+        ("β=2, clip_neg=True",  2.0, True, None, None, 1.0),
+        ("β=3, clip_neg=False", 3.0, False, None, None, 1.0),
+        ("β=4, clip_neg=False", 4.0, False, None, None, 1.0),
+    ]
+
+test_images = []
+for label, beta_val, clip_val, top_frac_val, step_range_val, clip_cap_val in configs:
+    print(f"  Generating: {label}...")
+    img = steerer.generate(DIAG_PROMPT, DIAG_SEED, vectors=vectors,
+                           beta=beta_val, clip_negative=clip_val,
+                           top_frac=top_frac_val, step_range=step_range_val,
+                           clip_cap=clip_cap_val)
+    test_images.append((label, img))
+
+# --- Visual comparison ---
+n_imgs = 3 + len(test_images)  # t5_zero + clip_zero + baseline + tests
+fig, axes = plt.subplots(2, 4, figsize=(28, 14))
+axes = axes.flatten()
+
+# T5 zeroed test
+axes[0].imshow(t5_zeroed_img)
+axes[0].set_title("TEST 0a: T5=0\n(expect minimal change)", fontsize=10, color='blue')
+axes[0].axis("off")
+
+# CLIP zeroed test
+axes[1].imshow(clip_zeroed_img)
+axes[1].set_title("TEST 0b: CLIP=0\n(expect pure noise)", fontsize=10, color='red')
+axes[1].axis("off")
+
+# Baseline
+axes[2].imshow(baseline_img)
+axes[2].set_title("Baseline (no steering)", fontsize=10)
+axes[2].axis("off")
+
+# Test images
+baseline_arr = np.array(baseline_img).astype(float)
+for i, (label, img) in enumerate(test_images):
+    ax = axes[i + 3]
+    ax.imshow(img)
+    # Compute pixel difference
+    diff = np.abs(np.array(img).astype(float) - baseline_arr)
+    mean_diff = diff.mean()
+    max_diff = diff.max()
+    pct_changed = (diff > 1.0).mean() * 100
+    ax.set_title(f"{label}\ndiff: mean={mean_diff:.1f}, {pct_changed:.0f}% changed", fontsize=10,
+                 color='green' if pct_changed > 10 else 'orange' if pct_changed > 1 else 'red')
+    ax.axis("off")
+
+# Hide unused axes
+for i in range(n_imgs, len(axes)):
+    axes[i].axis("off")
+
+plt.suptitle(f"Steering Test: {TARGET_CONCEPT} ({STEERING_MODE})\n"
+             f"Vectors: {sum(len(v) for v in vectors.values())} total",
+             fontsize=14, fontweight="bold")
+plt.tight_layout()
+plt.show()
+
+# --- Summary ---
+print("\n" + "="*70)
+print("SUMMARY")
+print("="*70)
+
+# Check CLIP zeroing test (should be dramatically different)
+clip_diff = np.abs(np.array(clip_zeroed_img).astype(float) - baseline_arr).mean()
+if clip_diff > 10:
+    print("✓ TEST 0 PASSED: Hooks DO fire (destructive test produced different image)")
+else:
+    print("✗ TEST 0 FAILED: Hooks DON'T fire! context_embedder×0 had no effect!")
+    print("  → This means PyTorch hooks don't work with this FLUX pipeline.")
+    print("  → Try: steerer.pipe.transformer = torch.compile(steerer.pipe.transformer, mode='reduce-overhead')")
+    print("  → Or: monkey-patch the forward method directly instead of using hooks.")
+
+print()
+for label, img in test_images:
+    diff = np.abs(np.array(img).astype(float) - baseline_arr)
+    mean_diff = diff.mean()
+    pct = (diff > 1.0).mean() * 100
+    status = "✓ WORKING" if pct > 10 else "⚠ WEAK" if pct > 1 else "✗ NO EFFECT"
+    print(f"  {status}: {label:<25} mean_diff={mean_diff:>6.1f}  pixels_changed={pct:>5.1f}%")
+
+print()
+print("NEXT STEPS:")
+best_config = None
+for label, img in test_images:
+    diff = np.abs(np.array(img).astype(float) - baseline_arr)
+    pct = (diff > 1.0).mean() * 100
+    if pct > 10:
+        best_config = label
+        break
+if best_config:
+    print(f"  → Best config: {best_config}")
+    print(f"  → Update BETA and CLIP_NEGATIVE in Cell 7, then run full evaluation")
+else:
+    print("  → No configuration produced visible steering effect")
+    print("  → If TEST 0 passed: the learned DIRECTIONS don't capture 'Dog'")
+    print("     at the evaluation prompt format. Try different prompt templates.")
+    print("  → If TEST 0 failed: hooks don't work, need different approach.")
+print("="*70)
+
+# ============================================================================
+# CELL 9: UNLEARNCANVAS EVALUATION (UA, IRA, CRA)
+# ============================================================================
+# TWO-PHASE EVALUATION:
+#   Phase 1: Generate ALL images with FLUX (skips existing = resume support)
+#   Phase 2: Unload FLUX, load LLaVA, classify all images from disk
+# Total images = len(STYLES) * len(OBJECTS) * len(EVAL_SEEDS)
+# e.g., 10 styles x 20 objects x 3 seeds = 600 images
+# ============================================================================
+
+print("Running UnlearnCanvas evaluation (two-phase: generate then classify)...")
+print(f"This will generate {len(STYLES) * len(OBJECTS) * len(EVAL_SEEDS)} images.\n")
+
+# Evaluate unlearning on full grid
+# clip_negative=False for objects: allows steering even if dot products are negative
+# (learned direction from "tench with Dog" may be flipped relative to "A Dog image in...")
+CLIP_NEGATIVE = True if TARGET_TYPE == "style" else False
+
+eval_results = evaluator.evaluate_unlearning(
+    steerer=steerer,
+    vectors=vectors,
+    target_concept=TARGET_CONCEPT,
+    target_type=TARGET_TYPE,
+    beta=BETA,
+    clip_negative=CLIP_NEGATIVE,
+    top_frac=TOP_FRAC,
+    step_range=STEP_RANGE,
+    clip_cap=CLIP_CAP,
+    eval_seeds=EVAL_SEEDS,
+    save_images=True,
+    output_dir=OUTPUT_DIR,
+    generate_baselines=True
+)
+
+# ============================================================================
+# CELL 10: QUALITY METRICS (FID, CLIP Score)
+# ============================================================================
+
+print("\n" + "="*70)
+print("CALCULATING QUALITY METRICS")
+print("="*70)
+
+quality_results = {}
+
+# Load generated images from disk for quality metrics
+print("Loading generated images from disk for quality metrics...")
+_gen_images = []
+_gen_prompts = []
+for fname in sorted(os.listdir(OUTPUT_DIR)):
+    if fname.endswith(".jpg") or fname.endswith(".png"):
+        _gen_images.append(Image.open(os.path.join(OUTPUT_DIR, fname)).convert("RGB"))
+        # Reconstruct prompt from filename: Style_Object_seedN.jpg
+        parts = fname.rsplit("_seed", 1)[0]  # "Style_Object"
+        style_obj = parts.split("_", 1) if "_" in parts else [parts, ""]
+        _gen_prompts.append(f"A {style_obj[-1].replace('_', ' ')} image in {style_obj[0].replace('_', ' ')} style.")
+print(f"Loaded {len(_gen_images)} images from {OUTPUT_DIR}")
+
+# CLIP Score
+print("\n1. CLIP Score (text-image alignment)...")
+clip_score = quality_metrics.calculate_clip_score(
+    _gen_images,
+    eval_results["prompts"] if eval_results["prompts"] else _gen_prompts
+)
+quality_results["CLIP_Score"] = clip_score
+if clip_score:
+    print(f"   ✓ CLIP Score: {clip_score:.4f}")
+
+# FID (requires baseline images)
+print("\n2. FID Score (image quality)...")
+baseline_path = os.path.join(BASELINE_DIR, TARGET_CONCEPT)
+if os.path.exists(baseline_path) and len(os.listdir(baseline_path)) > 0:
+    fid_score = quality_metrics.calculate_fid(baseline_path, OUTPUT_DIR)
+    quality_results["FID"] = fid_score
+    if fid_score:
+        print(f"   ✓ FID: {fid_score:.2f}")
+else:
+    print(f"   ⚠ Baseline images not found at {baseline_path}")
+    print("   → Generate baseline images first (without steering)")
+    quality_results["FID"] = None
+
+print("\n" + "="*70)
+
+# ============================================================================
+# CELL 11: COMPILE AND SAVE RESULTS
+# ============================================================================
+
+# Compile all results
+final_results = {
+    "Target_Concept": TARGET_CONCEPT,
+    "Target_Type": TARGET_TYPE,
+    "Beta": BETA,
+    "UA": eval_results["UA"],
+    "IRA": eval_results["IRA"],
+    "CRA": eval_results["CRA"],
+    "CLIP_Score": quality_results.get("CLIP_Score"),
+    "FID": quality_results.get("FID"),
+    "n_images": eval_results["n_images"],
+    "timestamp": datetime.now().isoformat()
+}
+
+# Save to CSV (append mode)
+df_new = pd.DataFrame([final_results])
+if os.path.exists(RESULTS_CSV):
+    df_existing = pd.read_csv(RESULTS_CSV)
+    df_all = pd.concat([df_existing, df_new], ignore_index=True)
+else:
+    df_all = df_new
+df_all.to_csv(RESULTS_CSV, index=False)
+
+# Print summary
+print("\n" + "="*70)
+print("FINAL RESULTS SUMMARY")
+print("="*70)
+print(f"\nTarget: {TARGET_CONCEPT} ({TARGET_TYPE})")
+print(f"Steering β: {BETA}")
+print(f"\n--- UnlearnCanvas Metrics ---")
+print(f"UA  (Unlearning Accuracy):     {eval_results['UA']:.2%}")
+print(f"IRA (In-Domain Retain):        {eval_results['IRA']:.2%}")
+print(f"CRA (Cross-Domain Retain):     {eval_results['CRA']:.2%}")
+print(f"\n--- Quality Metrics ---")
+if quality_results.get("CLIP_Score"):
+    print(f"CLIP Score:                    {quality_results['CLIP_Score']:.4f}")
+if quality_results.get("FID"):
+    print(f"FID:                           {quality_results['FID']:.2f}")
+print(f"\n--- Files ---")
+print(f"Results CSV: {RESULTS_CSV}")
+print(f"Vectors:     {vector_path}")
+print(f"Images:      {OUTPUT_DIR}")
+print("="*70)
+
+# ============================================================================
+# CELL 12: GENERATE COMPARISON TABLE (vs Baselines)
+# ============================================================================
+"""
+Compare our results against baselines from the TRACE paper (ICLR 2026).
+- Table 1 (FLUX baselines): LOCOEDIT, UCE, TRACE - most relevant comparison
+- Table 2 (SD1.5 baselines): broader context from UnlearnCanvas benchmark
+"""
+
+# --- Table A: FLUX baselines from TRACE Table 1 (most relevant) ---
+flux_baselines = {
+    "Method": ["LOCOEDIT (Flux)", "UCE (Flux)", "TRACE (Flux)", "Ours (Steering)"],
+    "UA": [66.45, 67.43, 88.60, eval_results["UA"]*100],
+    "IRA": [33.23, 34.78, 36.10, eval_results["IRA"]*100],
+    "CRA": [83.44, 76.56, 96.40, eval_results["CRA"]*100],
+    "FID": [55.56, 58.90, 51.67, quality_results.get("FID", "N/A")]
+}
+
+df_flux = pd.DataFrame(flux_baselines)
+
+print("\n" + "="*70)
+print("COMPARISON WITH FLUX BASELINES (TRACE Table 1 - Style Removal)")
+print("="*70)
+print(df_flux.to_string(index=False))
+print("\nSource: TRACE paper (ICLR 2026), Table 1")
+print("Higher UA = better unlearning, Higher IRA/CRA = better retention")
+print("Lower FID = better image quality")
+print("="*70)
+
+# --- Table B: SD1.5 baselines from TRACE Table 2 (broader context) ---
+sd15_baselines = {
+    "Method": ["ESD", "FMN", "UCE", "CA", "SalUn", "SEOT", "SPM", "EDiff", "SHS", "SAeUron", "TRACE"],
+    "UA": [98.58, 88.48, 98.40, 60.82, 86.26, 56.90, 60.94, 92.42, 95.84, 95.80, 95.02],
+    "IRA": [80.97, 56.77, 60.22, 96.01, 90.39, 94.68, 92.39, 73.91, 80.42, 99.10, 93.84],
+    "CRA": [93.96, 46.60, 47.71, 92.70, 95.08, 84.31, 84.33, 98.93, 43.27, 99.40, 86.22],
+}
+
+df_sd15 = pd.DataFrame(sd15_baselines)
+
+print("\n" + "="*70)
+print("SD1.5 BASELINES FOR BROADER CONTEXT (TRACE Table 2)")
+print("="*70)
+print(df_sd15.to_string(index=False))
+print("\nNote: SD1.5 numbers are NOT directly comparable to FLUX results.")
+print("They are provided for broader context only.")
+print("="*70)
+
+# Save comparison tables
+comparison_path = os.path.join(TABLES_DIR, f"comparison_{TARGET_CONCEPT}_flux.csv")
+df_flux.to_csv(comparison_path, index=False)
+sd15_path = os.path.join(TABLES_DIR, f"comparison_sd15_baselines.csv")
+df_sd15.to_csv(sd15_path, index=False)
+print(f"\nSaved FLUX comparison: {comparison_path}")
+print(f"Saved SD1.5 baselines: {sd15_path}")
+
+# ============================================================================
+# CELL 13: RUN FULL BENCHMARK (Multiple Concepts)
+# ============================================================================
+# Controlled by RUN_FULL_BENCHMARK flag in config cell.
+# Two-phase approach per target: generate ALL images, then classify ALL.
+# Supports resume: if interrupted, re-run and existing images are skipped.
+# ============================================================================
+
+if not RUN_FULL_BENCHMARK:
+    print("Skipping full benchmark. Set RUN_FULL_BENCHMARK = True in config cell to run.")
+else:
+    import time as _time
+    STYLES_TO_EVAL = STYLES  # All 10 styles from TRACE paper
+    all_results = []
+    _bench_start = _time.time()
+
+    for style_idx, style in enumerate(STYLES_TO_EVAL):
+        print(f"\n{'#'*70}")
+        print(f"# [{style_idx+1}/{len(STYLES_TO_EVAL)}] EVALUATING: {style}")
+        print(f"{'#'*70}")
+
+        # Check if results already exist (resume support)
+        if os.path.exists(RESULTS_CSV):
+            existing_df = pd.read_csv(RESULTS_CSV)
+            if style in existing_df['style'].values:
+                print(f"  Results for {style} already in CSV, skipping.")
+                row = existing_df[existing_df['style'] == style].iloc[0]
+                all_results.append({
+                    'target_concept': style, 'UA': row['ua']/100,
+                    'IRA': row['ira']/100, 'CRA': row['cra']/100
+                })
+                continue
+
+        # Ensure FLUX is on GPU for vector learning
+        steerer.pipe.to(steerer.device)
+
+        # Check for saved vectors first (resume support)
+        vpath = os.path.join(VECTOR_DIR, f"{style}_{STEERING_MODE}_diverse_vectors.pt")
+        if os.path.exists(vpath):
+            print(f"  Loading saved vectors from {vpath}")
+            vectors = steerer.load_vectors(vpath)
+        else:
+            # Use diverse prompt pairs (CASteer methodology)
+            style_pairs = make_style_prompts(style.replace('_', ' '), NUM_DIVERSE_PROMPTS)
+            vectors = steerer.learn_vectors_diverse(
+                prompt_pairs=style_pairs,
+                seed=0,
+                top_k=TOP_K_VECTORS,
+                verbose=False
+            )
+            steerer.save_vectors(vectors, vpath)
+
+        # evaluate_unlearning handles: generate -> free FLUX -> classify -> reload FLUX
+        results = evaluator.evaluate_unlearning(
+            steerer=steerer,
+            vectors=vectors,
+            target_concept=style,
+            target_type="style",
+            beta=BETA,
+            top_frac=TOP_FRAC,
+            step_range=STEP_RANGE,
+            clip_cap=CLIP_CAP,
+            eval_seeds=EVAL_SEEDS,
+            save_images=True,
+            generate_baselines=(style_idx == 0)  # baselines only for first style
+        )
+
+        all_results.append(results)
+
+        # Append per-style results to CSV incrementally
+        pd.DataFrame([{
+            "style": style,
+            "ua": results["UA"] * 100,
+            "ira": results["IRA"] * 100,
+            "cra": results["CRA"] * 100
+        }]).to_csv(RESULTS_CSV, mode='a', header=not os.path.exists(RESULTS_CSV), index=False)
+
+        elapsed = _time.time() - _bench_start
+        eta = elapsed / (style_idx + 1) * (len(STYLES_TO_EVAL) - style_idx - 1)
+        print(f"  Elapsed: {elapsed/60:.1f} min | ETA: {eta/60:.1f} min")
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    # Summary table
+    print(f"\n{'='*70}")
+    print("FULL BENCHMARK SUMMARY")
+    print(f"{'='*70}")
+    df_summary = pd.DataFrame([{
+        "Concept": r["target_concept"],
+        "UA%": f"{r['UA']*100:.1f}",
+        "IRA%": f"{r['IRA']*100:.1f}",
+        "CRA%": f"{r['CRA']*100:.1f}"
+    } for r in all_results])
+    print(df_summary.to_string(index=False))
+
+    avg_ua = np.mean([r['UA'] for r in all_results]) * 100
+    avg_ira = np.mean([r['IRA'] for r in all_results]) * 100
+    avg_cra = np.mean([r['CRA'] for r in all_results]) * 100
+    total_time = (_time.time() - _bench_start) / 60
+    print(f"\nAVERAGE:  UA={avg_ua:.1f}%  IRA={avg_ira:.1f}%  CRA={avg_cra:.1f}%")
+    print(f"Total time: {total_time:.1f} minutes")
+    print(f"{'='*70}")
+
+# ============================================================================
+# CELL 13: VISUALIZATION - BASELINE vs STEERED COMPARISON
+# ============================================================================
+"""
+Side-by-side visual comparison of baseline (no steering) vs steered images.
+Uses the same sample prompts and seeds as the evaluator's baseline generation.
+Run AFTER Cell 9 (evaluation) so that both baseline and steered images exist.
+"""
+
+print("="*80)
+print("GENERATING COMPARISON VISUALIZATIONS")
+print("="*80)
+
+baseline_concept_dir = os.path.join(BASELINE_DIR, TARGET_CONCEPT)
+vis_seed = EVAL_SEEDS[0]  # same seed used for baseline generation in evaluator
+
+# Use the same sample configs as evaluate_unlearning's baseline generation
+if TARGET_TYPE == "style":
+    vis_configs = [
+        (TARGET_CONCEPT, "Dog"),
+        (TARGET_CONCEPT, "Cat"),
+        (TARGET_CONCEPT, "Bird"),
+    ]
+else:
+    vis_configs = [
+        ("Van_Gogh", TARGET_CONCEPT),
+        ("Cartoon", TARGET_CONCEPT),
+        ("Pop_Art", TARGET_CONCEPT),
+    ]
+
+# Collect valid pairs (both baseline and steered must exist)
+pairs = []
+for style, obj in vis_configs:
+    filename = f"{style}_{obj}_seed{vis_seed}.jpg"
+    prompt = f"A {obj.replace('_', ' ')} image in {style.replace('_', ' ')} style."
+    b_path = os.path.join(baseline_concept_dir, filename)
+    s_path = os.path.join(OUTPUT_DIR, filename)
+
+    has_baseline = os.path.exists(b_path)
+    has_steered = os.path.exists(s_path)
+
+    if has_baseline and has_steered:
+        pairs.append((prompt, b_path, s_path))
+    else:
+        missing = []
+        if not has_baseline:
+            missing.append(f"baseline ({b_path})")
+        if not has_steered:
+            missing.append(f"steered  ({s_path})")
+        print(f"  Skipping '{filename}' — missing: {', '.join(missing)}")
+
+if len(pairs) == 0:
+    print("\nNo matching baseline/steered pairs found.")
+    print("Make sure you ran Cell 9 (evaluation) with generate_baselines=True first.")
+else:
+    n = len(pairs)
+    fig, axes = plt.subplots(n, 2, figsize=(12, 5 * n))
+    if n == 1:
+        axes = axes.reshape(1, -1)
+
+    for i, (prompt, b_path, s_path) in enumerate(pairs):
+        baseline_img = Image.open(b_path).convert("RGB")
+        steered_img = Image.open(s_path).convert("RGB")
+
+        axes[i, 0].imshow(baseline_img)
+        axes[i, 0].set_title(f"Baseline (no steering)\n{prompt}", fontsize=10)
+        axes[i, 0].axis("off")
+
+        axes[i, 1].imshow(steered_img)
+        axes[i, 1].set_title(f"Steered (beta={BETA})\n{prompt}", fontsize=10)
+        axes[i, 1].axis("off")
+
+    plt.suptitle(
+        f"Unlearning: {TARGET_CONCEPT} ({TARGET_TYPE}) | Mode: {STEERING_MODE} | beta={BETA}",
+        fontsize=14, fontweight="bold", y=1.01
+    )
+    plt.tight_layout()
+
+    vis_path = os.path.join(OUTPUT_DIR, f"comparison_{TARGET_CONCEPT}.png")
+    plt.savefig(vis_path, dpi=150, bbox_inches="tight")
+    plt.show()
+
+    print(f"\nSaved comparison figure: {vis_path}")
+    print(f"Displayed {n} baseline vs steered pairs.")
+
+"""## Summary
+
+### Key Results
+- **UA (Unlearning Accuracy)**: Measures how well the target concept is removed
+- **IRA (In-Domain Retain Accuracy)**: Measures preservation of related concepts
+- **CRA (Cross-Domain Retain Accuracy)**: Measures preservation of unrelated concepts
+
+### Comparison with Traditional Unlearning Methods
+Our steering vectors approach is inference-time and does NOT require:
+- Model retraining
+- Access to training data
+- Gradient computation
+
+This makes it significantly more efficient than methods like ESD, SalUn, etc.
+
+### Notes for Publication
+1. Use the same prompt format as UnlearnCanvas: `"A painting of {object} in {style} style"`
+2. Report metrics averaged over multiple concepts for robustness
+3. Consider using the official UnlearnCanvas classifiers for exact comparison
+"""
