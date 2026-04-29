@@ -2354,8 +2354,17 @@ if TARGET_TYPE == "style":
     neg_prompt = "neutral style"
 else:
     DIVERSE_PROMPT_PAIRS = make_object_prompts(TARGET_CONCEPT.replace('_', ' '), NUM_DIVERSE_PROMPTS)
-    pos_prompt = f"{TARGET_CONCEPT.replace('_', ' ')}"
-    neg_prompt = "Object"
+    # Single-pair anchors used by pincer_perstep / hybrid (which call
+    # learn_vectors, not learn_vectors_diverse). The negative is now an
+    # explicit "empty scene" rather than the abstract noun "Object" so
+    # the diff (pos - neg) captures both the concept identity AND the
+    # foreground-reservation signal that the prompt structure
+    # introduces — subtracting that at apply time releases the
+    # foreground slot instead of letting the diffusion fill it with a
+    # substitute object (the "glass bubble / wooden box / fountain
+    # dome" artifacts seen with the previous "Object" anchor).
+    pos_prompt = f"a photo of a {TARGET_CONCEPT.replace('_', ' ')}"
+    neg_prompt = "an empty scene, no objects, nothing"
 
 print("="*70)
 print("EXPERIMENT CONFIGURATION")
