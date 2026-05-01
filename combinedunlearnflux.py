@@ -2519,107 +2519,182 @@ print(f"\nSaved FLUX comparison: {comparison_path}")
 print(f"Saved SD1.5 baselines: {sd15_path}")
 
 # ============================================================================
-# CELL 13: RUN FULL BENCHMARK (Multiple Concepts)
+# CELL 13: RUN FULL BENCHMARK -- PAPER-STYLE TABLE
 # ============================================================================
-# Controlled by RUN_FULL_BENCHMARK flag in config cell.
-# Two-phase approach per target: generate ALL images, then classify ALL.
+# Iterates ALL concepts of TARGET_TYPE (10 styles or 20 objects), learns a
+# steering vector per concept, runs the UnlearnCanvas evaluation, and
+# assembles a per-concept results table that mirrors the UnlearnCanvas /
+# TRACE paper format:
+#
+#   Concept       UA%   IRA%  CRA%  FID    CLIP
+#   Van_Gogh      ...   ...   ...   ...    ...
+#   Watercolor    ...   ...   ...   ...    ...
+#   ...
+#   AVERAGE       ...   ...   ...   ...    ...
+#
+# Two-phase per concept: generate ALL images, then classify ALL.
 # Supports resume: if interrupted, re-run and existing images are skipped.
+# Controlled by RUN_FULL_BENCHMARK flag in config cell.
 # ============================================================================
 
 if not RUN_FULL_BENCHMARK:
     print("Skipping full benchmark. Set RUN_FULL_BENCHMARK = True in config cell to run.")
 else:
     import time as _time
-    STYLES_TO_EVAL = STYLES  # All 10 styles from TRACE paper
-    all_results = []
+
+    # ----------------------------------------------------------------------
+    # Pick the concept set + per-concept prompt-pair generator + paper-style
+    # CSV path based on TARGET_TYPE. Style runs sweep STYLES (10 from TRACE);
+    # object runs sweep OBJECTS (20 from UnlearnCanvas/TRACE).
+    # ----------------------------------------------------------------------
+    if TARGET_TYPE == "style":
+        CONCEPTS_TO_EVAL = STYLES
+        make_pairs = make_style_prompts
+        bench_label = "STYLE UNLEARNING"
+    else:
+        CONCEPTS_TO_EVAL = OBJECTS
+        make_pairs = make_object_prompts
+        bench_label = "OBJECT UNLEARNING"
+
+    paper_csv = os.path.join(TABLES_DIR, f"paper_table_{TARGET_TYPE}_{STEERING_MODE}.csv")
+    all_rows = []
     _bench_start = _time.time()
 
-    for style_idx, style in enumerate(STYLES_TO_EVAL):
-        print(f"\n{'#'*70}")
-        print(f"# [{style_idx+1}/{len(STYLES_TO_EVAL)}] EVALUATING: {style}")
-        print(f"{'#'*70}")
+    print(f"\n{'#'*70}")
+    print(f"# FULL BENCHMARK: {bench_label} ({STEERING_MODE})")
+    print(f"# {len(CONCEPTS_TO_EVAL)} target concepts x {len(STYLES)*len(OBJECTS)*len(EVAL_SEEDS)} eval images each")
+    print(f"#{'#'*69}")
 
-        # Check if results already exist (resume support)
-        if os.path.exists(RESULTS_CSV):
-            existing_df = pd.read_csv(RESULTS_CSV)
-            if style in existing_df['style'].values:
-                print(f"  Results for {style} already in CSV, skipping.")
-                row = existing_df[existing_df['style'] == style].iloc[0]
-                all_results.append({
-                    'target_concept': style, 'UA': row['ua']/100,
-                    'IRA': row['ira']/100, 'CRA': row['cra']/100
-                })
-                continue
+    for c_idx, concept in enumerate(CONCEPTS_TO_EVAL):
+        print(f"\n{'#'*70}")
+        print(f"# [{c_idx+1}/{len(CONCEPTS_TO_EVAL)}] EVALUATING: {concept}")
+        print(f"{'#'*70}")
 
         # Ensure FLUX is on GPU for vector learning
         steerer.pipe.to(steerer.device)
 
-        # Check for saved vectors first (resume support)
-        vpath = os.path.join(VECTOR_DIR, f"{style}_{STEERING_MODE}_diverse_vectors.pt")
+        # ------------------------------------------------------------------
+        # Vectors: load if cached, else learn from diverse pairs.
+        # ------------------------------------------------------------------
+        vpath = os.path.join(VECTOR_DIR, f"{concept}_{STEERING_MODE}_diverse_vectors.pt")
         if os.path.exists(vpath):
             print(f"  Loading saved vectors from {vpath}")
             vectors = steerer.load_vectors(vpath)
         else:
-            # Use diverse prompt pairs (CASteer methodology)
-            style_pairs = make_style_prompts(style.replace('_', ' '), NUM_DIVERSE_PROMPTS)
+            pairs = make_pairs(concept.replace('_', ' '), NUM_DIVERSE_PROMPTS)
             vectors = steerer.learn_vectors_diverse(
-                prompt_pairs=style_pairs,
+                prompt_pairs=pairs,
                 seed=0,
                 top_k=TOP_K_VECTORS,
                 verbose=False
             )
             steerer.save_vectors(vectors, vpath)
 
-        # evaluate_unlearning handles: generate -> free FLUX -> classify -> reload FLUX
-        results = evaluator.evaluate_unlearning(
+        # ------------------------------------------------------------------
+        # Evaluation: UA / IRA / CRA via LLaVA classification.
+        # evaluate_unlearning handles generate -> free FLUX -> classify ->
+        # reload FLUX automatically. baseline images are needed for FID, so
+        # generate them on the first concept only (they don't depend on the
+        # target since they're always unsteered).
+        # ------------------------------------------------------------------
+        eval_out = evaluator.evaluate_unlearning(
             steerer=steerer,
             vectors=vectors,
-            target_concept=style,
-            target_type="style",
+            target_concept=concept,
+            target_type=TARGET_TYPE,
             beta=BETA,
+            clip_negative=(True if TARGET_TYPE == "style" else False),
             top_frac=TOP_FRAC,
             step_range=STEP_RANGE,
             clip_cap=CLIP_CAP,
             eval_seeds=EVAL_SEEDS,
             save_images=True,
-            generate_baselines=(style_idx == 0)  # baselines only for first style
+            generate_baselines=(c_idx == 0),
         )
 
-        all_results.append(results)
+        # ------------------------------------------------------------------
+        # Quality metrics: FID + CLIP Score for this concept.
+        # FID compares the steered output dir against the unsteered baseline
+        # dir (UnlearnCanvas paper protocol).
+        # ------------------------------------------------------------------
+        steered_dir = os.path.join(STEERED_DIR, f"{concept}_{steerer.mode}")
+        baseline_dir_concept = os.path.join(BASELINE_DIR, concept)
 
-        # Append per-style results to CSV incrementally
-        pd.DataFrame([{
-            "style": style,
-            "ua": results["UA"] * 100,
-            "ira": results["IRA"] * 100,
-            "cra": results["CRA"] * 100
-        }]).to_csv(RESULTS_CSV, mode='a', header=not os.path.exists(RESULTS_CSV), index=False)
+        fid_score = None
+        if os.path.isdir(baseline_dir_concept) and len(os.listdir(baseline_dir_concept)) > 0:
+            try:
+                fid_score = quality_metrics.calculate_fid(
+                    steered_dir, baseline_dir_concept
+                )
+            except Exception as e:
+                print(f"  ⚠ FID failed: {e}")
+
+        clip_score = None
+        try:
+            # Reuse the same prompts that produced the steered images.
+            steered_imgs, steered_prompts = [], []
+            for style in STYLES:
+                for obj in OBJECTS:
+                    for seed in EVAL_SEEDS:
+                        fp = os.path.join(steered_dir, f"{style}_{obj}_seed{seed}.jpg")
+                        if os.path.exists(fp):
+                            steered_imgs.append(Image.open(fp).convert("RGB"))
+                            steered_prompts.append(
+                                f"A {obj.replace('_', ' ')} image in {style.replace('_', ' ')} style."
+                            )
+            if steered_imgs:
+                clip_score = quality_metrics.calculate_clip_score(steered_imgs, steered_prompts)
+        except Exception as e:
+            print(f"  ⚠ CLIP score failed: {e}")
+
+        # ------------------------------------------------------------------
+        # Row for the paper-style table.
+        # ------------------------------------------------------------------
+        row = {
+            "Concept":  concept,
+            "UA%":      eval_out["UA"]  * 100,
+            "IRA%":     eval_out["IRA"] * 100,
+            "CRA%":     eval_out["CRA"] * 100,
+            "FID":      fid_score    if fid_score    is not None else float("nan"),
+            "CLIP":     clip_score   if clip_score   is not None else float("nan"),
+        }
+        all_rows.append(row)
+
+        # Save incrementally so a crash mid-sweep doesn't lose finished rows.
+        pd.DataFrame(all_rows).to_csv(paper_csv, index=False)
 
         elapsed = _time.time() - _bench_start
-        eta = elapsed / (style_idx + 1) * (len(STYLES_TO_EVAL) - style_idx - 1)
+        eta = elapsed / (c_idx + 1) * (len(CONCEPTS_TO_EVAL) - c_idx - 1)
+        print(f"  {concept}: UA={row['UA%']:.1f}%  IRA={row['IRA%']:.1f}%  "
+              f"CRA={row['CRA%']:.1f}%  FID={row['FID']:.2f}  CLIP={row['CLIP']:.4f}")
         print(f"  Elapsed: {elapsed/60:.1f} min | ETA: {eta/60:.1f} min")
 
         gc.collect()
         torch.cuda.empty_cache()
 
-    # Summary table
-    print(f"\n{'='*70}")
-    print("FULL BENCHMARK SUMMARY")
-    print(f"{'='*70}")
-    df_summary = pd.DataFrame([{
-        "Concept": r["target_concept"],
-        "UA%": f"{r['UA']*100:.1f}",
-        "IRA%": f"{r['IRA']*100:.1f}",
-        "CRA%": f"{r['CRA']*100:.1f}"
-    } for r in all_results])
-    print(df_summary.to_string(index=False))
+    # ----------------------------------------------------------------------
+    # Final paper-style table: per-concept rows + AVERAGE.
+    # Mirrors UnlearnCanvas Table 1 / 2 layout (one method, one concept type).
+    # ----------------------------------------------------------------------
+    df_paper = pd.DataFrame(all_rows)
+    avg_row = {
+        "Concept": "AVERAGE",
+        "UA%":     df_paper["UA%"].mean(),
+        "IRA%":    df_paper["IRA%"].mean(),
+        "CRA%":    df_paper["CRA%"].mean(),
+        "FID":     df_paper["FID"].mean(skipna=True),
+        "CLIP":    df_paper["CLIP"].mean(skipna=True),
+    }
+    df_paper = pd.concat([df_paper, pd.DataFrame([avg_row])], ignore_index=True)
+    df_paper.to_csv(paper_csv, index=False)
 
-    avg_ua = np.mean([r['UA'] for r in all_results]) * 100
-    avg_ira = np.mean([r['IRA'] for r in all_results]) * 100
-    avg_cra = np.mean([r['CRA'] for r in all_results]) * 100
+    print(f"\n{'='*70}")
+    print(f"PAPER-STYLE TABLE: {bench_label} ({STEERING_MODE})")
+    print(f"{'='*70}")
+    print(df_paper.to_string(index=False, float_format=lambda v: f"{v:.2f}"))
     total_time = (_time.time() - _bench_start) / 60
-    print(f"\nAVERAGE:  UA={avg_ua:.1f}%  IRA={avg_ira:.1f}%  CRA={avg_cra:.1f}%")
-    print(f"Total time: {total_time:.1f} minutes")
+    print(f"\nTotal time: {total_time:.1f} minutes")
+    print(f"Saved: {paper_csv}")
     print(f"{'='*70}")
 
 # ============================================================================
