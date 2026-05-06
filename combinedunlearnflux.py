@@ -2571,6 +2571,32 @@ else:
     print(f"# {len(CONCEPTS_TO_EVAL)} target concepts x {len(STYLES)*len(OBJECTS)*len(EVAL_SEEDS)} eval images each")
     print(f"#{'#'*69}")
 
+    # ----------------------------------------------------------------------
+    # Pre-generate the SHARED unsteered baseline grid for FID.
+    # Unsteered FLUX outputs depend only on (prompt, seed), not on the
+    # target concept — so one grid is reused as the FID reference for
+    # every concept in the sweep. Resume-safe: existing files are skipped.
+    # ----------------------------------------------------------------------
+    SHARED_BASELINE_DIR = os.path.join(BASELINE_DIR, "_shared_grid")
+    os.makedirs(SHARED_BASELINE_DIR, exist_ok=True)
+    expected = len(STYLES) * len(OBJECTS) * len(EVAL_SEEDS)
+    have = len([f for f in os.listdir(SHARED_BASELINE_DIR) if f.endswith(".jpg")])
+    if have < expected:
+        print(f"\nGenerating shared unsteered baseline grid "
+              f"({have}/{expected} present)...")
+        steerer.pipe.to(steerer.device)
+        for style in tqdm(STYLES, desc="Baselines"):
+            for obj in OBJECTS:
+                for seed in EVAL_SEEDS:
+                    fp = os.path.join(SHARED_BASELINE_DIR,
+                                      f"{style}_{obj}_seed{seed}.jpg")
+                    if not os.path.exists(fp):
+                        prompt = f"A {obj} image in {style.replace('_', ' ')} style."
+                        steerer.generate(prompt, seed, vectors=None).save(fp)
+        print(f"Shared baselines ready: {SHARED_BASELINE_DIR}")
+    else:
+        print(f"Shared baselines already complete: {SHARED_BASELINE_DIR}")
+
     for c_idx, concept in enumerate(CONCEPTS_TO_EVAL):
         print(f"\n{'#'*70}")
         print(f"# [{c_idx+1}/{len(CONCEPTS_TO_EVAL)}] EVALUATING: {concept}")
@@ -2615,25 +2641,21 @@ else:
             clip_cap=CLIP_CAP,
             eval_seeds=EVAL_SEEDS,
             save_images=True,
-            generate_baselines=(c_idx == 0),
+            generate_baselines=False,  # shared grid above handles FID baselines
         )
 
         # ------------------------------------------------------------------
         # Quality metrics: FID + CLIP Score for this concept.
-        # FID compares the steered output dir against the unsteered baseline
-        # dir (UnlearnCanvas paper protocol).
+        # FID compares this concept's steered grid against the SHARED
+        # unsteered baseline grid (concept-independent reference set).
         # ------------------------------------------------------------------
         steered_dir = os.path.join(STEERED_DIR, f"{concept}_{steerer.mode}")
-        baseline_dir_concept = os.path.join(BASELINE_DIR, concept)
 
         fid_score = None
-        if os.path.isdir(baseline_dir_concept) and len(os.listdir(baseline_dir_concept)) > 0:
-            try:
-                fid_score = quality_metrics.calculate_fid(
-                    steered_dir, baseline_dir_concept
-                )
-            except Exception as e:
-                print(f"  ⚠ FID failed: {e}")
+        try:
+            fid_score = quality_metrics.calculate_fid(steered_dir, SHARED_BASELINE_DIR)
+        except Exception as e:
+            print(f"  ⚠ FID failed: {e}")
 
         clip_score = None
         try:
