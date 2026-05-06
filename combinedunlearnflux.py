@@ -2760,22 +2760,38 @@ else:
             search_results[concept],
             key=lambda k: search_results[concept][k]["score"])
         best = search_results[concept][best_combo_key]
+
+        # Boundary diagnostic: if the picked combo is the first or last
+        # entry of the grid, the true optimum may lie outside the searched
+        # range. Flag it so we know to extend the grid in that direction.
+        first_key = (f"clip{SEARCH_BETAS[0]['clip']}_"
+                     f"t5{SEARCH_BETAS[0]['t5']}")
+        last_key  = (f"clip{SEARCH_BETAS[-1]['clip']}_"
+                     f"t5{SEARCH_BETAS[-1]['t5']}")
+        boundary_warning = ""
+        if best_combo_key == first_key:
+            boundary_warning = " ⚠ LOW-BOUNDARY (try weaker beta in extended grid)"
+        elif best_combo_key == last_key:
+            boundary_warning = " ⚠ HIGH-BOUNDARY (try stronger beta in extended grid)"
+
         best_params[concept] = {
-            "beta":          best["beta"],
-            "clip_negative": SEARCH_CLIP_NEG,
-            "top_frac":      SEARCH_TOP_FRAC,
-            "step_range":    list(SEARCH_STEP_RANGE),
-            "clip_cap":      SEARCH_CLIP_CAP,
-            "proxy_UA":      best["UA"],
-            "proxy_IRA":     best["IRA"],
-            "proxy_CRA":     best["CRA"],
-            "proxy_score":   best["score"],
-            "best_combo":    best_combo_key,
+            "beta":             best["beta"],
+            "clip_negative":    SEARCH_CLIP_NEG,
+            "top_frac":         SEARCH_TOP_FRAC,
+            "step_range":       list(SEARCH_STEP_RANGE),
+            "clip_cap":         SEARCH_CLIP_CAP,
+            "proxy_UA":         best["UA"],
+            "proxy_IRA":        best["IRA"],
+            "proxy_CRA":        best["CRA"],
+            "proxy_score":      best["score"],
+            "best_combo":       best_combo_key,
+            "boundary_warning": bool(boundary_warning),
         }
         print(f"  [{c_idx+1}/{len(SEARCH_CONCEPTS)}] {concept:15s} -> "
               f"{best_combo_key:18s} "
               f"UA={best['UA']:5.1f}  IRA={best['IRA']:5.1f}  "
-              f"CRA={best['CRA']:5.1f}  score={best['score']:5.1f}")
+              f"CRA={best['CRA']:5.1f}  score={best['score']:5.1f}"
+              f"{boundary_warning}")
 
     if hasattr(evaluator, 'llava') and evaluator.llava is not None:
         evaluator.llava.unload()
@@ -2791,6 +2807,19 @@ else:
 
     print(f"\nSaved best_params -> {best_params_path}")
     print(f"Saved search log  -> {search_log_path}")
+
+    # ─── Boundary summary ───────────────────────────────────────────────
+    flagged = [c for c, p in best_params.items() if p.get("boundary_warning")]
+    if flagged:
+        print(f"\n⚠ {len(flagged)} concept(s) picked a boundary combo:")
+        for c in flagged:
+            print(f"    {c:15s} -> {best_params[c]['best_combo']}  "
+                  f"(score={best_params[c]['proxy_score']:.1f})")
+        print("  These concepts may benefit from extending the search grid in "
+              "the indicated direction (edit SEARCH_BETAS and re-run with "
+              "FORCE_HPARAM_SEARCH=True).")
+    else:
+        print("\n✓ No concepts picked boundary combos — grid coverage looks adequate.")
 
 print(f"\nbest_params is now available for Cell 13 "
       f"({len(best_params)} concepts).")
