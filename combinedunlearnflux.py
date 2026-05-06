@@ -2612,13 +2612,21 @@ PROXY_SEEDS        = [188, 288]
 def _build_proxy_for_concept(concept, target_type):
     """Return (proxy_styles, proxy_objects) with the target injected.
     Ensures every concept has at least one proxy image where it is the
-    target axis, so UA is well-defined for that concept."""
+    target axis, so UA is well-defined for that concept.
+
+    Sized to give exactly 12 images per (concept, combo) regardless of
+    whether the target is already in the base list:
+      style target  -> 3 styles x 2 objects x 2 seeds = 12
+      object target -> 3 styles x 2 objects x 2 seeds = 12
+    """
     if target_type == "style":
+        # 3 styles total; cap forces dedup-aware truncation.
         styles = list(dict.fromkeys([concept] + PROXY_STYLES_BASE))[:3]
-        objects = PROXY_OBJECTS_BASE
+        objects = PROXY_OBJECTS_BASE  # already 2
     else:
-        styles = PROXY_STYLES_BASE
-        objects = list(dict.fromkeys([concept] + PROXY_OBJECTS_BASE))[:3]
+        styles = PROXY_STYLES_BASE   # 3
+        # 2 objects total: target + first base entry not equal to target.
+        objects = list(dict.fromkeys([concept] + PROXY_OBJECTS_BASE))[:2]
     return styles, objects
 
 PROXY_DIR = os.path.join(
