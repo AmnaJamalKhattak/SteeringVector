@@ -2525,6 +2525,249 @@ print(f"\nSaved FLUX comparison: {comparison_path}")
 print(f"Saved SD1.5 baselines: {sd15_path}")
 
 # ============================================================================
+# CELL 12B: PER-CONCEPT HYPERPARAMETER SEARCH
+# ============================================================================
+# Object/style unlearning is concept-dependent: a single global beta is too
+# strong for some concepts (over-steering -> CRA collapses) and too weak for
+# others (UA stays near 0). Empirically observed at beta={"clip":3,"t5":5}:
+#   UA=100% but CRA=30% on Architectures (over-steered)
+#   UA=2%   on Butterfly                  (under-steered)
+#
+# This cell does a small grid search per concept on a proxy eval set,
+# scores each combo with LLaVA, and picks the (clip, t5) that maximises a
+# composite UA/IRA/CRA score. Results are cached to Drive so reruns are
+# instant. Cell 13 reads per-concept params from this cache.
+#
+# Cost on A100:
+#   Object: 20 concepts x 5 combos x 18 proxy images ~ 90 min gen + 60 min
+#           LLaVA = ~2.5 hrs total (one-time cost).
+#   Style : 10 concepts x 4 combos x 18 proxy images ~ 35 min gen + 30 min
+#           LLaVA = ~1 hr total.
+# ============================================================================
+import json
+
+FORCE_HPARAM_SEARCH = False   # set True to redo search even if cache exists
+
+best_params_path = os.path.join(
+    TABLES_DIR, f"best_params_{TARGET_TYPE}_{STEERING_MODE}.json")
+search_log_path = os.path.join(
+    TABLES_DIR, f"search_log_{TARGET_TYPE}_{STEERING_MODE}.json")
+
+# ----------------------------------------------------------------------
+# Search grid (different scale per type).
+# Style: clip is fixed at 0 (style identity lives in T5); sweep t5.
+# Object: pooled-CLIP carries object identity, both axes need sweeping.
+# ----------------------------------------------------------------------
+if TARGET_TYPE == "style":
+    SEARCH_BETAS = [
+        {"clip": 0.0, "t5": 1.0},
+        {"clip": 0.0, "t5": 2.0},
+        {"clip": 0.0, "t5": 4.0},
+        {"clip": 0.0, "t5": 6.0},
+    ]
+    SEARCH_TOP_FRAC  = 1.0
+    SEARCH_STEP_RANGE = (0, N_STEPS)
+    SEARCH_CLIP_NEG  = True
+    SEARCH_CLIP_CAP  = 1.0
+else:
+    SEARCH_BETAS = [
+        {"clip": 1.0, "t5": 3.0},
+        {"clip": 3.0, "t5": 3.0},
+        {"clip": 3.0, "t5": 5.0},
+        {"clip": 5.0, "t5": 5.0},
+        {"clip": 5.0, "t5": 8.0},
+    ]
+    SEARCH_TOP_FRAC  = None
+    SEARCH_STEP_RANGE = (0, N_STEPS)
+    SEARCH_CLIP_NEG  = True       # observed to work better than False
+    SEARCH_CLIP_CAP  = None       # uncapped CLIP push (object recipe)
+
+# ----------------------------------------------------------------------
+# Proxy set: small enough for fast scoring, diverse enough for signal.
+# 3 proxy styles x 3 proxy objects x 2 seeds = 18 images per (concept, combo).
+# ----------------------------------------------------------------------
+PROXY_OBJECTS = ["Dogs", "Cats", "Birds"]
+PROXY_STYLES  = ["Van_Gogh", "Cartoon", "Watercolor"]
+PROXY_SEEDS   = [188, 288]
+
+PROXY_DIR = os.path.join(
+    STEERED_DIR, f"_hparam_proxy_{TARGET_TYPE}_{STEERING_MODE}")
+os.makedirs(PROXY_DIR, exist_ok=True)
+
+# ----------------------------------------------------------------------
+# Composite scoring objective.
+# 0.4*UA + 0.3*IRA + 0.3*CRA penalises both over- and under-steering.
+# CRA is critical for objects (over-steering destroys scene identity).
+# ----------------------------------------------------------------------
+def _composite_score(ua, ira, cra):
+    return 0.4 * ua + 0.3 * ira + 0.3 * cra
+
+# ----------------------------------------------------------------------
+# Skip search entirely if cached.
+# ----------------------------------------------------------------------
+if os.path.exists(best_params_path) and not FORCE_HPARAM_SEARCH:
+    with open(best_params_path) as f:
+        best_params = json.load(f)
+    print(f"Loaded cached per-concept best_params from {best_params_path}")
+    print(f"  ({len(best_params)} concepts cached)")
+    print("  Set FORCE_HPARAM_SEARCH=True above to re-run.")
+else:
+    if TARGET_TYPE == "style":
+        SEARCH_CONCEPTS = STYLES
+        make_pairs_search = make_style_prompts
+    else:
+        SEARCH_CONCEPTS = OBJECTS
+        make_pairs_search = make_object_prompts
+
+    print(f"\n{'='*70}")
+    print(f"HYPERPARAMETER SEARCH: {TARGET_TYPE.upper()} ({STEERING_MODE})")
+    print(f"{'='*70}")
+    n_imgs_per_concept = (len(SEARCH_BETAS) * len(PROXY_STYLES) *
+                          len(PROXY_OBJECTS) * len(PROXY_SEEDS))
+    print(f"Concepts:    {len(SEARCH_CONCEPTS)}")
+    print(f"Beta combos: {len(SEARCH_BETAS)}")
+    print(f"Proxy/combo: {len(PROXY_STYLES)*len(PROXY_OBJECTS)*len(PROXY_SEEDS)}")
+    print(f"Proxy/concept: {n_imgs_per_concept}")
+    print(f"Total proxy images: {len(SEARCH_CONCEPTS) * n_imgs_per_concept}")
+
+    # ─── Phase 1: proxy image generation ────────────────────────────────
+    print(f"\n--- PHASE 1: PROXY GENERATION ---")
+    steerer.pipe.to(steerer.device)
+
+    for c_idx, concept in enumerate(SEARCH_CONCEPTS):
+        print(f"\n  [{c_idx+1}/{len(SEARCH_CONCEPTS)}] {concept}")
+
+        # Reuse cached vectors (or learn once if missing) — independent of beta.
+        vpath = os.path.join(VECTOR_DIR,
+            f"{concept}_{STEERING_MODE}_diverse_vectors.pt")
+        if os.path.exists(vpath):
+            vectors = steerer.load_vectors(vpath)
+        else:
+            pairs = make_pairs_search(concept.replace('_', ' '), NUM_DIVERSE_PROMPTS)
+            vectors = steerer.learn_vectors_diverse(
+                prompt_pairs=pairs, seed=0, top_k=TOP_K_VECTORS, verbose=False)
+            steerer.save_vectors(vectors, vpath)
+
+        for beta_dict in tqdm(SEARCH_BETAS, desc=f"  combos", leave=False):
+            combo_key = f"clip{beta_dict['clip']}_t5{beta_dict['t5']}"
+            for style in PROXY_STYLES:
+                for obj in PROXY_OBJECTS:
+                    for seed in PROXY_SEEDS:
+                        fname = f"{concept}__{combo_key}__{style}_{obj}_seed{seed}.jpg"
+                        fp = os.path.join(PROXY_DIR, fname)
+                        if os.path.exists(fp):
+                            continue
+                        prompt = f"A {obj} image in {style.replace('_', ' ')} style."
+                        img = steerer.generate(
+                            prompt, seed, vectors=vectors,
+                            beta=beta_dict, clip_negative=SEARCH_CLIP_NEG,
+                            top_frac=SEARCH_TOP_FRAC,
+                            step_range=SEARCH_STEP_RANGE,
+                            clip_cap=SEARCH_CLIP_CAP,
+                        )
+                        img.save(fp)
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    # ─── Phase 2: LLaVA scoring ─────────────────────────────────────────
+    print(f"\n--- PHASE 2: LLAVA SCORING ---")
+    print("Freeing FLUX VRAM before loading LLaVA...")
+    steerer.pipe.to('cpu')
+    gc.collect()
+    torch.cuda.empty_cache()
+    evaluator.llava.load() if hasattr(evaluator, 'llava') else None
+
+    search_results = {}
+    best_params = {}
+
+    for c_idx, concept in enumerate(SEARCH_CONCEPTS):
+        search_results[concept] = {}
+        for beta_dict in SEARCH_BETAS:
+            combo_key = f"clip{beta_dict['clip']}_t5{beta_dict['t5']}"
+            ua_t = ua_c = ira_t = ira_c = cra_t = cra_c = 0
+
+            for style in PROXY_STYLES:
+                for obj in PROXY_OBJECTS:
+                    for seed in PROXY_SEEDS:
+                        fname = f"{concept}__{combo_key}__{style}_{obj}_seed{seed}.jpg"
+                        fp = os.path.join(PROXY_DIR, fname)
+                        if not os.path.exists(fp):
+                            continue
+                        img = Image.open(fp).convert("RGB")
+
+                        if TARGET_TYPE == "style":
+                            pred_style  = evaluator.classify_image(img, domain="style")
+                            pred_object = evaluator.classify_image(img, domain="object")
+                            if style == concept:
+                                ua_t += 1
+                                ua_c += int(pred_style != concept)
+                            else:
+                                ira_t += 1
+                                ira_c += int(pred_style == style)
+                                cra_t += 1
+                                cra_c += int(pred_object == obj)
+                        else:  # object target
+                            pred_object = evaluator.classify_image(img, domain="object")
+                            pred_style  = evaluator.classify_image(img, domain="style")
+                            if obj == concept:
+                                ua_t += 1
+                                ua_c += int(pred_object != concept)
+                            else:
+                                ira_t += 1
+                                ira_c += int(pred_object == obj)
+                                cra_t += 1
+                                cra_c += int(pred_style == style)
+
+            UA  = 100 * ua_c  / max(ua_t,  1)
+            IRA = 100 * ira_c / max(ira_t, 1)
+            CRA = 100 * cra_c / max(cra_t, 1)
+            score = _composite_score(UA, IRA, CRA)
+            search_results[concept][combo_key] = {
+                "beta": beta_dict, "UA": UA, "IRA": IRA, "CRA": CRA, "score": score
+            }
+
+        # Pick best combo for this concept by composite score.
+        best_combo_key = max(
+            search_results[concept],
+            key=lambda k: search_results[concept][k]["score"])
+        best = search_results[concept][best_combo_key]
+        best_params[concept] = {
+            "beta":          best["beta"],
+            "clip_negative": SEARCH_CLIP_NEG,
+            "top_frac":      SEARCH_TOP_FRAC,
+            "step_range":    list(SEARCH_STEP_RANGE),
+            "clip_cap":      SEARCH_CLIP_CAP,
+            "proxy_UA":      best["UA"],
+            "proxy_IRA":     best["IRA"],
+            "proxy_CRA":     best["CRA"],
+            "proxy_score":   best["score"],
+            "best_combo":    best_combo_key,
+        }
+        print(f"  [{c_idx+1}/{len(SEARCH_CONCEPTS)}] {concept:15s} -> "
+              f"{best_combo_key:18s} "
+              f"UA={best['UA']:5.1f}  IRA={best['IRA']:5.1f}  "
+              f"CRA={best['CRA']:5.1f}  score={best['score']:5.1f}")
+
+    if hasattr(evaluator, 'llava') and evaluator.llava is not None:
+        evaluator.llava.unload()
+    steerer.pipe.to(steerer.device)
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # ─── Save to Drive ──────────────────────────────────────────────────
+    with open(best_params_path, "w") as f:
+        json.dump(best_params, f, indent=2)
+    with open(search_log_path, "w") as f:
+        json.dump(search_results, f, indent=2)
+
+    print(f"\nSaved best_params -> {best_params_path}")
+    print(f"Saved search log  -> {search_log_path}")
+
+print(f"\nbest_params is now available for Cell 13 "
+      f"({len(best_params)} concepts).")
+
+# ============================================================================
 # CELL 13: RUN FULL BENCHMARK -- PAPER-STYLE TABLE
 # ============================================================================
 # Iterates ALL concepts of TARGET_TYPE (10 styles or 20 objects), learns a
@@ -2629,16 +2872,28 @@ else:
         # generate them on the first concept only (they don't depend on the
         # target since they're always unsteered).
         # ------------------------------------------------------------------
+        # Per-concept hyperparameters from Cell 12B's search (with global
+        # fallback if a concept is missing from best_params for any reason).
+        params = best_params.get(concept, {
+            "beta":          BETA,
+            "clip_negative": True,
+            "top_frac":      TOP_FRAC,
+            "step_range":    list(STEP_RANGE),
+            "clip_cap":      CLIP_CAP,
+        })
+        print(f"  Using params: beta={params['beta']}, "
+              f"clip_neg={params['clip_negative']}, clip_cap={params['clip_cap']}")
+
         eval_out = evaluator.evaluate_unlearning(
             steerer=steerer,
             vectors=vectors,
             target_concept=concept,
             target_type=TARGET_TYPE,
-            beta=BETA,
-            clip_negative=(True if TARGET_TYPE == "style" else False),
-            top_frac=TOP_FRAC,
-            step_range=STEP_RANGE,
-            clip_cap=CLIP_CAP,
+            beta=params["beta"],
+            clip_negative=params["clip_negative"],
+            top_frac=params["top_frac"],
+            step_range=tuple(params["step_range"]),
+            clip_cap=params["clip_cap"],
             eval_seeds=EVAL_SEEDS,
             save_images=True,
             generate_baselines=False,  # shared grid above handles FID baselines
