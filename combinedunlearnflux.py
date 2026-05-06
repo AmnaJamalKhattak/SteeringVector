@@ -2948,7 +2948,37 @@ else:
     else:
         print(f"Shared baselines already complete: {SHARED_BASELINE_DIR}")
 
+    # ----------------------------------------------------------------------
+    # Concept-level resume: if a concept already has a row in the paper CSV,
+    # skip its full eval entirely (load the existing row back into
+    # all_rows). Avoids re-classifying 1000 images per concept on resume.
+    # To redo a concept: delete its row from the CSV (and optionally its
+    # steered_images dir if the params changed).
+    # ----------------------------------------------------------------------
+    completed_concepts = set()
+    if os.path.exists(paper_csv):
+        try:
+            _existing = pd.read_csv(paper_csv)
+            # Drop any AVERAGE row from a previous full run.
+            _existing = _existing[_existing["Concept"] != "AVERAGE"].copy()
+            for _, row in _existing.iterrows():
+                concept_name = str(row["Concept"])
+                completed_concepts.add(concept_name)
+                all_rows.append(row.to_dict())
+            if completed_concepts:
+                print(f"Resume: {len(completed_concepts)} concept(s) already in "
+                      f"{paper_csv}, will skip:")
+                print(f"  {sorted(completed_concepts)}")
+        except Exception as _e:
+            print(f"⚠ Could not parse existing paper CSV ({_e}); starting fresh.")
+            all_rows = []
+            completed_concepts = set()
+
     for c_idx, concept in enumerate(CONCEPTS_TO_EVAL):
+        if concept in completed_concepts:
+            print(f"\n[{c_idx+1}/{len(CONCEPTS_TO_EVAL)}] {concept}: "
+                  f"already in paper CSV, skipping.")
+            continue
         print(f"\n{'#'*70}")
         print(f"# [{c_idx+1}/{len(CONCEPTS_TO_EVAL)}] EVALUATING: {concept}")
         print(f"{'#'*70}")
