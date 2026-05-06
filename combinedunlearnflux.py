@@ -2581,12 +2581,17 @@ if TARGET_TYPE == "style":
     SEARCH_CLIP_NEG  = True
     SEARCH_CLIP_CAP  = 1.0
 else:
+    # Object grid: brackets the operating range observed empirically.
+    # Under-steered concepts (Butterfly UA=2, Flame UA=0, Flowers UA=4 at
+    # clip=3/t5=5) need substantially higher beta -- hence the 8/12 and
+    # 10/15 entries. Over-steered concepts (Architectures, Bears at
+    # UA=100, CRA=30) can try the lower 1/3 entry to recover IRA/CRA.
     SEARCH_BETAS = [
-        {"clip": 1.0, "t5": 3.0},
-        {"clip": 3.0, "t5": 3.0},
-        {"clip": 3.0, "t5": 5.0},
-        {"clip": 5.0, "t5": 5.0},
-        {"clip": 5.0, "t5": 8.0},
+        {"clip": 1.0, "t5": 3.0},     # weakest -- for over-steered concepts
+        {"clip": 3.0, "t5": 5.0},     # current default
+        {"clip": 5.0, "t5": 8.0},     # stronger -- mid-range escalation
+        {"clip": 8.0, "t5": 12.0},    # very strong -- for under-steered
+        {"clip": 10.0, "t5": 15.0},   # max -- for stubbornly under-steered
     ]
     SEARCH_TOP_FRAC  = None
     SEARCH_STEP_RANGE = (0, N_STEPS)
