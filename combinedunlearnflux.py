@@ -2626,24 +2626,27 @@ PROXY_DIR = os.path.join(
 os.makedirs(PROXY_DIR, exist_ok=True)
 
 # ----------------------------------------------------------------------
-# Composite scoring objective (calibrated against TRACE Table 1 ceilings).
+# Composite scoring objective.
 #
-# IMPORTANT — the benchmark is asymmetric: removing the target axis
-# disrupts the OTHER axis, not same-axis siblings. TRACE's own Flux
-# numbers reflect this:
-#   Style removal: UA=88.6, IRA=36.1 (low),  CRA=96.4 (high)
-#   Object removal: UA=93.2, IRA=96.6 (high), CRA=38.2 (low)
-# Low CRA for object unlearning is *structural*, not a steering failure
-# (removing a dog disrupts scene composition broadly). Weighting CRA
-# heavily for objects fights the benchmark instead of optimising it.
+# Same formula for both style and object unlearning:
+#   score = 0.5 * UA + 0.25 * IRA + 0.25 * CRA
+#
+# Why these weights:
+#   * UA dominates (0.5) -- it is the headline metric. UnlearnCanvas
+#     paper Sec 5.1: "relying solely on UA can provide a skewed view"
+#     -> retention metrics must matter, but UA matters most.
+#   * IRA and CRA each at 0.25 -- equal weight. The UnlearnCanvas paper
+#     explicitly shows IRA and CRA dissociate (UCE: IRA=60.22 vs
+#     CRA=47.71 on style; similar gap on object). They measure
+#     different things, so we score them both, equally.
+#   * Single formula -> single methodology paragraph in the paper, no
+#     per-task asymmetric weights to defend.
+#
+# TRACE Table 1 reports all three metrics; optimizing for the same
+# triple they report keeps our search directly comparable.
 # ----------------------------------------------------------------------
-def _composite_score(ua, ira, cra, target_type):
-    if target_type == "object":
-        # CRA is expected to be ~38% (TRACE Flux ceiling). Weight it minimally.
-        return 0.5 * ua + 0.4 * ira + 0.1 * cra
-    else:  # style
-        # CRA stays high (objects survive style edits); IRA is the loss axis.
-        return 0.4 * ua + 0.2 * ira + 0.4 * cra
+def _composite_score(ua, ira, cra, target_type=None):
+    return 0.5 * ua + 0.25 * ira + 0.25 * cra
 
 # ----------------------------------------------------------------------
 # Skip search entirely if cached.
