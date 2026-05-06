@@ -2600,11 +2600,26 @@ else:
 
 # ----------------------------------------------------------------------
 # Proxy set: small enough for fast scoring, diverse enough for signal.
-# 3 proxy styles x 3 proxy objects x 2 seeds = 18 images per (concept, combo).
+# Default 3 styles x 2 objects x 2 seeds = 12 images per (concept, combo).
+# When iterating a concept, the proxy is built per-concept so the target
+# is ALWAYS in the relevant axis -- otherwise UA can't be computed (no
+# target images for that concept, ua_t = 0, search picks combo at random).
 # ----------------------------------------------------------------------
-PROXY_OBJECTS = ["Dogs", "Cats", "Birds"]
-PROXY_STYLES  = ["Van_Gogh", "Cartoon", "Watercolor"]
-PROXY_SEEDS   = [188, 288]
+PROXY_OBJECTS_BASE = ["Dogs", "Cats"]
+PROXY_STYLES_BASE  = ["Van_Gogh", "Cartoon", "Watercolor"]
+PROXY_SEEDS        = [188, 288]
+
+def _build_proxy_for_concept(concept, target_type):
+    """Return (proxy_styles, proxy_objects) with the target injected.
+    Ensures every concept has at least one proxy image where it is the
+    target axis, so UA is well-defined for that concept."""
+    if target_type == "style":
+        styles = list(dict.fromkeys([concept] + PROXY_STYLES_BASE))[:3]
+        objects = PROXY_OBJECTS_BASE
+    else:
+        styles = PROXY_STYLES_BASE
+        objects = list(dict.fromkeys([concept] + PROXY_OBJECTS_BASE))[:3]
+    return styles, objects
 
 PROXY_DIR = os.path.join(
     STEERED_DIR, f"_hparam_proxy_{TARGET_TYPE}_{STEERING_MODE}")
@@ -2650,13 +2665,16 @@ else:
     print(f"\n{'='*70}")
     print(f"HYPERPARAMETER SEARCH: {TARGET_TYPE.upper()} ({STEERING_MODE})")
     print(f"{'='*70}")
-    n_imgs_per_concept = (len(SEARCH_BETAS) * len(PROXY_STYLES) *
-                          len(PROXY_OBJECTS) * len(PROXY_SEEDS))
+    # Proxy size depends on whether the concept is already in the base list,
+    # so quote a typical-case count: 3 styles x 2 objects x 2 seeds = 12.
+    n_imgs_per_combo = (len(PROXY_STYLES_BASE) *
+                        (len(PROXY_OBJECTS_BASE) + 1) *
+                        len(PROXY_SEEDS)) // 1   # rough upper bound
     print(f"Concepts:    {len(SEARCH_CONCEPTS)}")
     print(f"Beta combos: {len(SEARCH_BETAS)}")
-    print(f"Proxy/combo: {len(PROXY_STYLES)*len(PROXY_OBJECTS)*len(PROXY_SEEDS)}")
-    print(f"Proxy/concept: {n_imgs_per_concept}")
-    print(f"Total proxy images: {len(SEARCH_CONCEPTS) * n_imgs_per_concept}")
+    print(f"Proxy/combo: ~12 images (3 styles x 2-3 objects x 2 seeds)")
+    print(f"Proxy/concept: ~{12 * len(SEARCH_BETAS)} images")
+    print(f"Total proxy images: ~{12 * len(SEARCH_BETAS) * len(SEARCH_CONCEPTS)}")
 
     # ─── Phase 1: proxy image generation ────────────────────────────────
     print(f"\n--- PHASE 1: PROXY GENERATION ---")
@@ -2676,10 +2694,11 @@ else:
                 prompt_pairs=pairs, seed=0, top_k=TOP_K_VECTORS, verbose=False)
             steerer.save_vectors(vectors, vpath)
 
+        proxy_styles, proxy_objects = _build_proxy_for_concept(concept, TARGET_TYPE)
         for beta_dict in tqdm(SEARCH_BETAS, desc=f"  combos", leave=False):
             combo_key = f"clip{beta_dict['clip']}_t5{beta_dict['t5']}"
-            for style in PROXY_STYLES:
-                for obj in PROXY_OBJECTS:
+            for style in proxy_styles:
+                for obj in proxy_objects:
                     for seed in PROXY_SEEDS:
                         fname = f"{concept}__{combo_key}__{style}_{obj}_seed{seed}.jpg"
                         fp = os.path.join(PROXY_DIR, fname)
@@ -2711,12 +2730,13 @@ else:
 
     for c_idx, concept in enumerate(SEARCH_CONCEPTS):
         search_results[concept] = {}
+        proxy_styles, proxy_objects = _build_proxy_for_concept(concept, TARGET_TYPE)
         for beta_dict in SEARCH_BETAS:
             combo_key = f"clip{beta_dict['clip']}_t5{beta_dict['t5']}"
             ua_t = ua_c = ira_t = ira_c = cra_t = cra_c = 0
 
-            for style in PROXY_STYLES:
-                for obj in PROXY_OBJECTS:
+            for style in proxy_styles:
+                for obj in proxy_objects:
                     for seed in PROXY_SEEDS:
                         fname = f"{concept}__{combo_key}__{style}_{obj}_seed{seed}.jpg"
                         fp = os.path.join(PROXY_DIR, fname)
