@@ -2878,6 +2878,26 @@ if not RUN_FULL_BENCHMARK:
     print("Skipping full benchmark. Set RUN_FULL_BENCHMARK = True in config cell to run.")
 else:
     import time as _time
+    import json as _json
+
+    # ----------------------------------------------------------------------
+    # Resume safety: if best_params isn't in memory (e.g., Cell 12B was
+    # skipped after a kernel restart), load it from the Drive cache. The
+    # JSON was written by Cell 12B at the end of its search.
+    # ----------------------------------------------------------------------
+    if "best_params" not in dir() or not isinstance(globals().get("best_params"), dict):
+        _bp_path = os.path.join(
+            TABLES_DIR, f"best_params_{TARGET_TYPE}_{STEERING_MODE}.json")
+        if os.path.exists(_bp_path):
+            with open(_bp_path) as _f:
+                best_params = _json.load(_f)
+            print(f"Loaded best_params from cache: {_bp_path} "
+                  f"({len(best_params)} concepts)")
+        else:
+            best_params = {}
+            print(f"⚠ No best_params cache found at {_bp_path}. "
+                  f"Cell 13 will use global BETA fallback for every concept. "
+                  f"Run Cell 12B first to perform per-concept hyperparameter search.")
 
     # ----------------------------------------------------------------------
     # Pick the concept set + per-concept prompt-pair generator + paper-style
