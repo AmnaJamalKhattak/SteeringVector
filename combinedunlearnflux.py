@@ -2878,6 +2878,26 @@ if not RUN_FULL_BENCHMARK:
     print("Skipping full benchmark. Set RUN_FULL_BENCHMARK = True in config cell to run.")
 else:
     import time as _time
+    import json as _json
+
+    # ----------------------------------------------------------------------
+    # Resume safety: if best_params isn't in memory (e.g., Cell 12B was
+    # skipped after a kernel restart), load it from the Drive cache. The
+    # JSON was written by Cell 12B at the end of its search.
+    # ----------------------------------------------------------------------
+    if "best_params" not in dir() or not isinstance(globals().get("best_params"), dict):
+        _bp_path = os.path.join(
+            TABLES_DIR, f"best_params_{TARGET_TYPE}_{STEERING_MODE}.json")
+        if os.path.exists(_bp_path):
+            with open(_bp_path) as _f:
+                best_params = _json.load(_f)
+            print(f"Loaded best_params from cache: {_bp_path} "
+                  f"({len(best_params)} concepts)")
+        else:
+            best_params = {}
+            print(f"⚠ No best_params cache found at {_bp_path}. "
+                  f"Cell 13 will use global BETA fallback for every concept. "
+                  f"Run Cell 12B first to perform per-concept hyperparameter search.")
 
     # ----------------------------------------------------------------------
     # Pick the concept set + per-concept prompt-pair generator + paper-style
@@ -2928,7 +2948,76 @@ else:
     else:
         print(f"Shared baselines already complete: {SHARED_BASELINE_DIR}")
 
+    # ----------------------------------------------------------------------
+    # Manual start control + automatic CSV-based resume.
+    #
+    # START_FROM lets you explicitly control which concept the loop starts
+    # at, regardless of what's in the CSV. Useful when you know the first
+    # N concepts are done (or broken and you want to redo from a specific
+    # point). Three accepted forms:
+    #   START_FROM = None       -> default: rely on CSV resume only
+    #   START_FROM = 5          -> int: skip the first 5 concepts (start at
+    #                              index 5, i.e. concept #6)
+    #   START_FROM = "Birds"    -> str: skip every concept BEFORE this one
+    #                              (the named concept is included)
+    #
+    # SKIP_CONCEPTS additionally lets you blacklist specific concepts.
+    #
+    # CSV-based resume (existing behavior) still applies on top: any concept
+    # already in the paper CSV is skipped automatically. This block is for
+    # cases where the CSV is incomplete or you want to override the auto.
+    # ----------------------------------------------------------------------
+    START_FROM = None              # None | int index | concept name string
+    SKIP_CONCEPTS = []             # list of concept names to always skip
+
+    completed_concepts = set()
+    if os.path.exists(paper_csv):
+        try:
+            _existing = pd.read_csv(paper_csv)
+            # Drop any AVERAGE row from a previous full run.
+            _existing = _existing[_existing["Concept"] != "AVERAGE"].copy()
+            for _, row in _existing.iterrows():
+                concept_name = str(row["Concept"])
+                completed_concepts.add(concept_name)
+                all_rows.append(row.to_dict())
+            if completed_concepts:
+                print(f"Resume: {len(completed_concepts)} concept(s) already in "
+                      f"{paper_csv}, will skip:")
+                print(f"  {sorted(completed_concepts)}")
+        except Exception as _e:
+            print(f"⚠ Could not parse existing paper CSV ({_e}); starting fresh.")
+            all_rows = []
+            completed_concepts = set()
+
+    # Resolve START_FROM into a concrete starting index.
+    start_idx = 0
+    if isinstance(START_FROM, int):
+        start_idx = max(0, min(START_FROM, len(CONCEPTS_TO_EVAL)))
+        print(f"START_FROM={START_FROM}: skipping concepts 0..{start_idx-1} "
+              f"({CONCEPTS_TO_EVAL[:start_idx]})")
+    elif isinstance(START_FROM, str) and START_FROM:
+        if START_FROM in CONCEPTS_TO_EVAL:
+            start_idx = CONCEPTS_TO_EVAL.index(START_FROM)
+            print(f"START_FROM='{START_FROM}': starting at index {start_idx} "
+                  f"(skipping {CONCEPTS_TO_EVAL[:start_idx]})")
+        else:
+            print(f"⚠ START_FROM='{START_FROM}' not found in CONCEPTS_TO_EVAL; "
+                  f"starting from index 0.")
+
+    if SKIP_CONCEPTS:
+        print(f"SKIP_CONCEPTS: will not run {SKIP_CONCEPTS}")
+
     for c_idx, concept in enumerate(CONCEPTS_TO_EVAL):
+        if c_idx < start_idx:
+            continue
+        if concept in SKIP_CONCEPTS:
+            print(f"\n[{c_idx+1}/{len(CONCEPTS_TO_EVAL)}] {concept}: "
+                  f"in SKIP_CONCEPTS, skipping.")
+            continue
+        if concept in completed_concepts:
+            print(f"\n[{c_idx+1}/{len(CONCEPTS_TO_EVAL)}] {concept}: "
+                  f"already in paper CSV, skipping.")
+            continue
         print(f"\n{'#'*70}")
         print(f"# [{c_idx+1}/{len(CONCEPTS_TO_EVAL)}] EVALUATING: {concept}")
         print(f"{'#'*70}")
