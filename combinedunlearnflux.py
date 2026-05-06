@@ -129,8 +129,19 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"✓ Using device: {DEVICE}")
 
 # Model configuration
-MODEL_ID = "black-forest-labs/FLUX.1-schnell"
+# IMPORTANT: TRACE Table 1 reports Flux results that look consistent with
+# FLUX.1-dev at 28+ steps (FID=51.67, HPSv3=8.49, Aesthetic=6.49 -- numbers
+# inconsistent with schnell's 4-step distillation). For paper-comparable
+# numbers against TRACE's "Flux: Ours" row, switch to "FLUX.1-dev" with
+# N_STEPS=28. Schnell is faster and license-permissive; dev is gated and
+# slower (~7x) but matches TRACE's reported distribution.
+# Confirm against TRACE's diffusion.py / Section 5.1 before final paper run.
+MODEL_ID = "black-forest-labs/FLUX.1-schnell"   # or "black-forest-labs/FLUX.1-dev"
 N_STEPS = 4 if "schnell" in MODEL_ID.lower() else 28
+if "schnell" in MODEL_ID.lower():
+    print("⚠ Using FLUX.1-schnell (4 steps). TRACE Table 1 numbers were likely "
+          "produced on FLUX.1-dev (28 steps). Numbers may not be directly "
+          "comparable to the published Flux row.")
 
 # Steering vector configuration
 LEARNING_SEEDS = list(range(0, 20))  # 20 seeds for learning vectors
@@ -2595,12 +2606,24 @@ PROXY_DIR = os.path.join(
 os.makedirs(PROXY_DIR, exist_ok=True)
 
 # ----------------------------------------------------------------------
-# Composite scoring objective.
-# 0.4*UA + 0.3*IRA + 0.3*CRA penalises both over- and under-steering.
-# CRA is critical for objects (over-steering destroys scene identity).
+# Composite scoring objective (calibrated against TRACE Table 1 ceilings).
+#
+# IMPORTANT — the benchmark is asymmetric: removing the target axis
+# disrupts the OTHER axis, not same-axis siblings. TRACE's own Flux
+# numbers reflect this:
+#   Style removal: UA=88.6, IRA=36.1 (low),  CRA=96.4 (high)
+#   Object removal: UA=93.2, IRA=96.6 (high), CRA=38.2 (low)
+# Low CRA for object unlearning is *structural*, not a steering failure
+# (removing a dog disrupts scene composition broadly). Weighting CRA
+# heavily for objects fights the benchmark instead of optimising it.
 # ----------------------------------------------------------------------
-def _composite_score(ua, ira, cra):
-    return 0.4 * ua + 0.3 * ira + 0.3 * cra
+def _composite_score(ua, ira, cra, target_type):
+    if target_type == "object":
+        # CRA is expected to be ~38% (TRACE Flux ceiling). Weight it minimally.
+        return 0.5 * ua + 0.4 * ira + 0.1 * cra
+    else:  # style
+        # CRA stays high (objects survive style edits); IRA is the loss axis.
+        return 0.4 * ua + 0.2 * ira + 0.4 * cra
 
 # ----------------------------------------------------------------------
 # Skip search entirely if cached.
@@ -2722,7 +2745,7 @@ else:
             UA  = 100 * ua_c  / max(ua_t,  1)
             IRA = 100 * ira_c / max(ira_t, 1)
             CRA = 100 * cra_c / max(cra_t, 1)
-            score = _composite_score(UA, IRA, CRA)
+            score = _composite_score(UA, IRA, CRA, TARGET_TYPE)
             search_results[concept][combo_key] = {
                 "beta": beta_dict, "UA": UA, "IRA": IRA, "CRA": CRA, "score": score
             }
