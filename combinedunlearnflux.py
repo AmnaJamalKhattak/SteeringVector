@@ -129,8 +129,19 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"✓ Using device: {DEVICE}")
 
 # Model configuration
-MODEL_ID = "black-forest-labs/FLUX.1-schnell"
+# IMPORTANT: TRACE Table 1 reports Flux results that look consistent with
+# FLUX.1-dev at 28+ steps (FID=51.67, HPSv3=8.49, Aesthetic=6.49 -- numbers
+# inconsistent with schnell's 4-step distillation). For paper-comparable
+# numbers against TRACE's "Flux: Ours" row, switch to "FLUX.1-dev" with
+# N_STEPS=28. Schnell is faster and license-permissive; dev is gated and
+# slower (~7x) but matches TRACE's reported distribution.
+# Confirm against TRACE's diffusion.py / Section 5.1 before final paper run.
+MODEL_ID = "black-forest-labs/FLUX.1-schnell"   # or "black-forest-labs/FLUX.1-dev"
 N_STEPS = 4 if "schnell" in MODEL_ID.lower() else 28
+if "schnell" in MODEL_ID.lower():
+    print("⚠ Using FLUX.1-schnell (4 steps). TRACE Table 1 numbers were likely "
+          "produced on FLUX.1-dev (28 steps). Numbers may not be directly "
+          "comparable to the published Flux row.")
 
 # Steering vector configuration
 LEARNING_SEEDS = list(range(0, 20))  # 20 seeds for learning vectors
@@ -2525,6 +2536,326 @@ print(f"\nSaved FLUX comparison: {comparison_path}")
 print(f"Saved SD1.5 baselines: {sd15_path}")
 
 # ============================================================================
+# CELL 12B: PER-CONCEPT HYPERPARAMETER SEARCH
+# ============================================================================
+# Object/style unlearning is concept-dependent: a single global beta is too
+# strong for some concepts (over-steering -> CRA collapses) and too weak for
+# others (UA stays near 0). Empirically observed at beta={"clip":3,"t5":5}:
+#   UA=100% but CRA=30% on Architectures (over-steered)
+#   UA=2%   on Butterfly                  (under-steered)
+#
+# This cell does a small grid search per concept on a proxy eval set,
+# scores each combo with LLaVA, and picks the (clip, t5) that maximises a
+# composite UA/IRA/CRA score. Results are cached to Drive so reruns are
+# instant. Cell 13 reads per-concept params from this cache.
+#
+# Cost on A100:
+#   Object: 20 concepts x 5 combos x 18 proxy images ~ 90 min gen + 60 min
+#           LLaVA = ~2.5 hrs total (one-time cost).
+#   Style : 10 concepts x 4 combos x 18 proxy images ~ 35 min gen + 30 min
+#           LLaVA = ~1 hr total.
+# ============================================================================
+import json
+
+FORCE_HPARAM_SEARCH = False   # set True to redo search even if cache exists
+
+best_params_path = os.path.join(
+    TABLES_DIR, f"best_params_{TARGET_TYPE}_{STEERING_MODE}.json")
+search_log_path = os.path.join(
+    TABLES_DIR, f"search_log_{TARGET_TYPE}_{STEERING_MODE}.json")
+
+# ----------------------------------------------------------------------
+# Search grid (different scale per type).
+# Style: clip is fixed at 0 (style identity lives in T5); sweep t5.
+# Object: pooled-CLIP carries object identity, both axes need sweeping.
+# ----------------------------------------------------------------------
+if TARGET_TYPE == "style":
+    SEARCH_BETAS = [
+        {"clip": 0.0, "t5": 1.0},
+        {"clip": 0.0, "t5": 2.0},
+        {"clip": 0.0, "t5": 4.0},
+        {"clip": 0.0, "t5": 6.0},
+    ]
+    SEARCH_TOP_FRAC  = 1.0
+    SEARCH_STEP_RANGE = (0, N_STEPS)
+    SEARCH_CLIP_NEG  = True
+    SEARCH_CLIP_CAP  = 1.0
+else:
+    # Object grid: brackets the operating range observed empirically.
+    # Under-steered concepts (Butterfly UA=2, Flame UA=0, Flowers UA=4 at
+    # clip=3/t5=5) need substantially higher beta -- hence the 8/12 and
+    # 10/15 entries. Over-steered concepts (Architectures, Bears at
+    # UA=100, CRA=30) can try the lower 1/3 entry to recover IRA/CRA.
+    SEARCH_BETAS = [
+        {"clip": 1.0, "t5": 3.0},     # weakest -- for over-steered concepts
+        {"clip": 3.0, "t5": 5.0},     # current default
+        {"clip": 5.0, "t5": 8.0},     # stronger -- mid-range escalation
+        {"clip": 8.0, "t5": 12.0},    # very strong -- for under-steered
+        {"clip": 10.0, "t5": 15.0},   # max -- for stubbornly under-steered
+    ]
+    SEARCH_TOP_FRAC  = None
+    SEARCH_STEP_RANGE = (0, N_STEPS)
+    SEARCH_CLIP_NEG  = True       # observed to work better than False
+    SEARCH_CLIP_CAP  = None       # uncapped CLIP push (object recipe)
+
+# ----------------------------------------------------------------------
+# Proxy set: small enough for fast scoring, diverse enough for signal.
+# Default 3 styles x 2 objects x 2 seeds = 12 images per (concept, combo).
+# When iterating a concept, the proxy is built per-concept so the target
+# is ALWAYS in the relevant axis -- otherwise UA can't be computed (no
+# target images for that concept, ua_t = 0, search picks combo at random).
+# ----------------------------------------------------------------------
+PROXY_OBJECTS_BASE = ["Dogs", "Cats"]
+PROXY_STYLES_BASE  = ["Van_Gogh", "Cartoon", "Watercolor"]
+PROXY_SEEDS        = [188, 288]
+
+def _build_proxy_for_concept(concept, target_type):
+    """Return (proxy_styles, proxy_objects) with the target injected.
+    Ensures every concept has at least one proxy image where it is the
+    target axis, so UA is well-defined for that concept.
+
+    Sized to give exactly 12 images per (concept, combo) regardless of
+    whether the target is already in the base list:
+      style target  -> 3 styles x 2 objects x 2 seeds = 12
+      object target -> 3 styles x 2 objects x 2 seeds = 12
+    """
+    if target_type == "style":
+        # 3 styles total; cap forces dedup-aware truncation.
+        styles = list(dict.fromkeys([concept] + PROXY_STYLES_BASE))[:3]
+        objects = PROXY_OBJECTS_BASE  # already 2
+    else:
+        styles = PROXY_STYLES_BASE   # 3
+        # 2 objects total: target + first base entry not equal to target.
+        objects = list(dict.fromkeys([concept] + PROXY_OBJECTS_BASE))[:2]
+    return styles, objects
+
+PROXY_DIR = os.path.join(
+    STEERED_DIR, f"_hparam_proxy_{TARGET_TYPE}_{STEERING_MODE}")
+os.makedirs(PROXY_DIR, exist_ok=True)
+
+# ----------------------------------------------------------------------
+# Composite scoring objective.
+#
+# Same formula for both style and object unlearning:
+#   score = 0.5 * UA + 0.25 * IRA + 0.25 * CRA
+#
+# Why these weights:
+#   * UA dominates (0.5) -- it is the headline metric. UnlearnCanvas
+#     paper Sec 5.1: "relying solely on UA can provide a skewed view"
+#     -> retention metrics must matter, but UA matters most.
+#   * IRA and CRA each at 0.25 -- equal weight. The UnlearnCanvas paper
+#     explicitly shows IRA and CRA dissociate (UCE: IRA=60.22 vs
+#     CRA=47.71 on style; similar gap on object). They measure
+#     different things, so we score them both, equally.
+#   * Single formula -> single methodology paragraph in the paper, no
+#     per-task asymmetric weights to defend.
+#
+# TRACE Table 1 reports all three metrics; optimizing for the same
+# triple they report keeps our search directly comparable.
+# ----------------------------------------------------------------------
+def _composite_score(ua, ira, cra, target_type=None):
+    return 0.5 * ua + 0.25 * ira + 0.25 * cra
+
+# ----------------------------------------------------------------------
+# Skip search entirely if cached.
+# ----------------------------------------------------------------------
+if os.path.exists(best_params_path) and not FORCE_HPARAM_SEARCH:
+    with open(best_params_path) as f:
+        best_params = json.load(f)
+    print(f"Loaded cached per-concept best_params from {best_params_path}")
+    print(f"  ({len(best_params)} concepts cached)")
+    print("  Set FORCE_HPARAM_SEARCH=True above to re-run.")
+else:
+    if TARGET_TYPE == "style":
+        SEARCH_CONCEPTS = STYLES
+        make_pairs_search = make_style_prompts
+    else:
+        SEARCH_CONCEPTS = OBJECTS
+        make_pairs_search = make_object_prompts
+
+    print(f"\n{'='*70}")
+    print(f"HYPERPARAMETER SEARCH: {TARGET_TYPE.upper()} ({STEERING_MODE})")
+    print(f"{'='*70}")
+    # Proxy size depends on whether the concept is already in the base list,
+    # so quote a typical-case count: 3 styles x 2 objects x 2 seeds = 12.
+    n_imgs_per_combo = (len(PROXY_STYLES_BASE) *
+                        (len(PROXY_OBJECTS_BASE) + 1) *
+                        len(PROXY_SEEDS)) // 1   # rough upper bound
+    print(f"Concepts:    {len(SEARCH_CONCEPTS)}")
+    print(f"Beta combos: {len(SEARCH_BETAS)}")
+    print(f"Proxy/combo: ~12 images (3 styles x 2-3 objects x 2 seeds)")
+    print(f"Proxy/concept: ~{12 * len(SEARCH_BETAS)} images")
+    print(f"Total proxy images: ~{12 * len(SEARCH_BETAS) * len(SEARCH_CONCEPTS)}")
+
+    # ─── Phase 1: proxy image generation ────────────────────────────────
+    print(f"\n--- PHASE 1: PROXY GENERATION ---")
+    steerer.pipe.to(steerer.device)
+
+    for c_idx, concept in enumerate(SEARCH_CONCEPTS):
+        print(f"\n  [{c_idx+1}/{len(SEARCH_CONCEPTS)}] {concept}")
+
+        # Reuse cached vectors (or learn once if missing) — independent of beta.
+        vpath = os.path.join(VECTOR_DIR,
+            f"{concept}_{STEERING_MODE}_diverse_vectors.pt")
+        if os.path.exists(vpath):
+            vectors = steerer.load_vectors(vpath)
+        else:
+            pairs = make_pairs_search(concept.replace('_', ' '), NUM_DIVERSE_PROMPTS)
+            vectors = steerer.learn_vectors_diverse(
+                prompt_pairs=pairs, seed=0, top_k=TOP_K_VECTORS, verbose=False)
+            steerer.save_vectors(vectors, vpath)
+
+        proxy_styles, proxy_objects = _build_proxy_for_concept(concept, TARGET_TYPE)
+        for beta_dict in tqdm(SEARCH_BETAS, desc=f"  combos", leave=False):
+            combo_key = f"clip{beta_dict['clip']}_t5{beta_dict['t5']}"
+            for style in proxy_styles:
+                for obj in proxy_objects:
+                    for seed in PROXY_SEEDS:
+                        fname = f"{concept}__{combo_key}__{style}_{obj}_seed{seed}.jpg"
+                        fp = os.path.join(PROXY_DIR, fname)
+                        if os.path.exists(fp):
+                            continue
+                        prompt = f"A {obj} image in {style.replace('_', ' ')} style."
+                        img = steerer.generate(
+                            prompt, seed, vectors=vectors,
+                            beta=beta_dict, clip_negative=SEARCH_CLIP_NEG,
+                            top_frac=SEARCH_TOP_FRAC,
+                            step_range=SEARCH_STEP_RANGE,
+                            clip_cap=SEARCH_CLIP_CAP,
+                        )
+                        img.save(fp)
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    # ─── Phase 2: LLaVA scoring ─────────────────────────────────────────
+    print(f"\n--- PHASE 2: LLAVA SCORING ---")
+    print("Freeing FLUX VRAM before loading LLaVA...")
+    steerer.pipe.to('cpu')
+    gc.collect()
+    torch.cuda.empty_cache()
+    evaluator.llava.load() if hasattr(evaluator, 'llava') else None
+
+    search_results = {}
+    best_params = {}
+
+    for c_idx, concept in enumerate(SEARCH_CONCEPTS):
+        search_results[concept] = {}
+        proxy_styles, proxy_objects = _build_proxy_for_concept(concept, TARGET_TYPE)
+        for beta_dict in SEARCH_BETAS:
+            combo_key = f"clip{beta_dict['clip']}_t5{beta_dict['t5']}"
+            ua_t = ua_c = ira_t = ira_c = cra_t = cra_c = 0
+
+            for style in proxy_styles:
+                for obj in proxy_objects:
+                    for seed in PROXY_SEEDS:
+                        fname = f"{concept}__{combo_key}__{style}_{obj}_seed{seed}.jpg"
+                        fp = os.path.join(PROXY_DIR, fname)
+                        if not os.path.exists(fp):
+                            continue
+                        img = Image.open(fp).convert("RGB")
+
+                        if TARGET_TYPE == "style":
+                            pred_style  = evaluator.classify_image(img, domain="style")
+                            pred_object = evaluator.classify_image(img, domain="object")
+                            if style == concept:
+                                ua_t += 1
+                                ua_c += int(pred_style != concept)
+                            else:
+                                ira_t += 1
+                                ira_c += int(pred_style == style)
+                                cra_t += 1
+                                cra_c += int(pred_object == obj)
+                        else:  # object target
+                            pred_object = evaluator.classify_image(img, domain="object")
+                            pred_style  = evaluator.classify_image(img, domain="style")
+                            if obj == concept:
+                                ua_t += 1
+                                ua_c += int(pred_object != concept)
+                            else:
+                                ira_t += 1
+                                ira_c += int(pred_object == obj)
+                                cra_t += 1
+                                cra_c += int(pred_style == style)
+
+            UA  = 100 * ua_c  / max(ua_t,  1)
+            IRA = 100 * ira_c / max(ira_t, 1)
+            CRA = 100 * cra_c / max(cra_t, 1)
+            score = _composite_score(UA, IRA, CRA, TARGET_TYPE)
+            search_results[concept][combo_key] = {
+                "beta": beta_dict, "UA": UA, "IRA": IRA, "CRA": CRA, "score": score
+            }
+
+        # Pick best combo for this concept by composite score.
+        best_combo_key = max(
+            search_results[concept],
+            key=lambda k: search_results[concept][k]["score"])
+        best = search_results[concept][best_combo_key]
+
+        # Boundary diagnostic: if the picked combo is the first or last
+        # entry of the grid, the true optimum may lie outside the searched
+        # range. Flag it so we know to extend the grid in that direction.
+        first_key = (f"clip{SEARCH_BETAS[0]['clip']}_"
+                     f"t5{SEARCH_BETAS[0]['t5']}")
+        last_key  = (f"clip{SEARCH_BETAS[-1]['clip']}_"
+                     f"t5{SEARCH_BETAS[-1]['t5']}")
+        boundary_warning = ""
+        if best_combo_key == first_key:
+            boundary_warning = " ⚠ LOW-BOUNDARY (try weaker beta in extended grid)"
+        elif best_combo_key == last_key:
+            boundary_warning = " ⚠ HIGH-BOUNDARY (try stronger beta in extended grid)"
+
+        best_params[concept] = {
+            "beta":             best["beta"],
+            "clip_negative":    SEARCH_CLIP_NEG,
+            "top_frac":         SEARCH_TOP_FRAC,
+            "step_range":       list(SEARCH_STEP_RANGE),
+            "clip_cap":         SEARCH_CLIP_CAP,
+            "proxy_UA":         best["UA"],
+            "proxy_IRA":        best["IRA"],
+            "proxy_CRA":        best["CRA"],
+            "proxy_score":      best["score"],
+            "best_combo":       best_combo_key,
+            "boundary_warning": bool(boundary_warning),
+        }
+        print(f"  [{c_idx+1}/{len(SEARCH_CONCEPTS)}] {concept:15s} -> "
+              f"{best_combo_key:18s} "
+              f"UA={best['UA']:5.1f}  IRA={best['IRA']:5.1f}  "
+              f"CRA={best['CRA']:5.1f}  score={best['score']:5.1f}"
+              f"{boundary_warning}")
+
+    if hasattr(evaluator, 'llava') and evaluator.llava is not None:
+        evaluator.llava.unload()
+    steerer.pipe.to(steerer.device)
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # ─── Save to Drive ──────────────────────────────────────────────────
+    with open(best_params_path, "w") as f:
+        json.dump(best_params, f, indent=2)
+    with open(search_log_path, "w") as f:
+        json.dump(search_results, f, indent=2)
+
+    print(f"\nSaved best_params -> {best_params_path}")
+    print(f"Saved search log  -> {search_log_path}")
+
+    # ─── Boundary summary ───────────────────────────────────────────────
+    flagged = [c for c, p in best_params.items() if p.get("boundary_warning")]
+    if flagged:
+        print(f"\n⚠ {len(flagged)} concept(s) picked a boundary combo:")
+        for c in flagged:
+            print(f"    {c:15s} -> {best_params[c]['best_combo']}  "
+                  f"(score={best_params[c]['proxy_score']:.1f})")
+        print("  These concepts may benefit from extending the search grid in "
+              "the indicated direction (edit SEARCH_BETAS and re-run with "
+              "FORCE_HPARAM_SEARCH=True).")
+    else:
+        print("\n✓ No concepts picked boundary combos — grid coverage looks adequate.")
+
+print(f"\nbest_params is now available for Cell 13 "
+      f"({len(best_params)} concepts).")
+
+# ============================================================================
 # CELL 13: RUN FULL BENCHMARK -- PAPER-STYLE TABLE
 # ============================================================================
 # Iterates ALL concepts of TARGET_TYPE (10 styles or 20 objects), learns a
@@ -2629,16 +2960,28 @@ else:
         # generate them on the first concept only (they don't depend on the
         # target since they're always unsteered).
         # ------------------------------------------------------------------
+        # Per-concept hyperparameters from Cell 12B's search (with global
+        # fallback if a concept is missing from best_params for any reason).
+        params = best_params.get(concept, {
+            "beta":          BETA,
+            "clip_negative": True,
+            "top_frac":      TOP_FRAC,
+            "step_range":    list(STEP_RANGE),
+            "clip_cap":      CLIP_CAP,
+        })
+        print(f"  Using params: beta={params['beta']}, "
+              f"clip_neg={params['clip_negative']}, clip_cap={params['clip_cap']}")
+
         eval_out = evaluator.evaluate_unlearning(
             steerer=steerer,
             vectors=vectors,
             target_concept=concept,
             target_type=TARGET_TYPE,
-            beta=BETA,
-            clip_negative=(True if TARGET_TYPE == "style" else False),
-            top_frac=TOP_FRAC,
-            step_range=STEP_RANGE,
-            clip_cap=CLIP_CAP,
+            beta=params["beta"],
+            clip_negative=params["clip_negative"],
+            top_frac=params["top_frac"],
+            step_range=tuple(params["step_range"]),
+            clip_cap=params["clip_cap"],
             eval_seeds=EVAL_SEEDS,
             save_images=True,
             generate_baselines=False,  # shared grid above handles FID baselines
