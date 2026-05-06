@@ -114,13 +114,14 @@ STYLES = [
     "Pop_Art", "Ukiyoe", "Impressionism", "Byzantine", "Bricks"
 ]
 
-# All 20 object classes from UnlearnCanvas/TRACE paper (Figure 7)
-# Using singular form to match TRACE paper prompts exactly
+# All 20 object classes from UnlearnCanvas/TRACE paper.
+# Plural form to match TRACE's reference benchmark code (constants/const.py)
+# — LLaVA's multiple-choice classifier scores against these exact strings.
 OBJECTS = [
-    "Architecture", "Bear", "Bird", "Butterfly", "Cat", "Dog",
-    "Fish", "Flame", "Flowers", "Frog", "Horse", "Human",
-    "Jellyfish", "Rabbits", "Sandwich", "Sea", "Statue",
-    "Tower", "Tree", "Waterfalls"
+    "Architectures", "Bears", "Birds", "Butterfly", "Cats",
+    "Dogs", "Fishes", "Flame", "Flowers", "Frogs",
+    "Horses", "Human", "Jellyfish", "Rabbits", "Sandwiches",
+    "Sea", "Statues", "Towers", "Trees", "Waterfalls"
 ]
 
 # Device configuration
@@ -133,7 +134,7 @@ N_STEPS = 4 if "schnell" in MODEL_ID.lower() else 28
 
 # Steering vector configuration
 LEARNING_SEEDS = list(range(0, 20))  # 20 seeds for learning vectors
-EVAL_SEEDS = list(range(20, 23))     # 3 seeds for eval (increase for paper)
+EVAL_SEEDS = [188, 288, 588, 688, 888]  # TRACE's exact reproducibility seeds
 GLOBAL_BETA = 2.0                     # Steering strength (from CASteer paper)
 TOP_K_VECTORS = 15                    # Top-k steering vectors to use
 
@@ -1844,7 +1845,7 @@ class UnlearnCanvasEvaluator:
             sample_configs = []
             if target_type == "style":
                 sample_configs = [
-                    (target_concept, "Dog"), (target_concept, "Cat"), (target_concept, "Bird")
+                    (target_concept, "Dogs"), (target_concept, "Cats"), (target_concept, "Birds")
                 ]
             else:
                 sample_configs = [
@@ -1893,42 +1894,47 @@ class UnlearnCanvasEvaluator:
             gt_style = case["gt_style"]
             gt_object = case["gt_object"]
 
+            # TRACE-exact UA / IRA / CRA scoring (UnlearnCanvas paper Sec 4.2,
+            # mirrors TRACE llava.py:282-301):
+            #   target-domain image -> contributes to UA only
+            #   non-target image    -> contributes to IRA + CRA (NOT UA)
+            # CRA is computed strictly on non-target images so the target
+            # axis does not pollute cross-domain retention.
             if target_type == "style":
                 pred_style = self.classify_image(img, domain="style")
                 pred_object = self.classify_image(img, domain="object")
 
-                # UA: images whose prompt IS the target style
                 if gt_style == target_concept:
+                    # Target style image -> UA only.
                     results["target_total"] += 1
                     if pred_style == target_concept:
                         results["target_correct"] += 1
-                # IRA: other styles in same domain
                 else:
+                    # Non-target style -> IRA (style) + CRA (object).
                     results["ira_total"] += 1
                     if pred_style == gt_style:
                         results["ira_correct"] += 1
-
-                # CRA: object accuracy across ALL images
-                results["cra_total"] += 1
-                if pred_object == gt_object:
-                    results["cra_correct"] += 1
+                    results["cra_total"] += 1
+                    if pred_object == gt_object:
+                        results["cra_correct"] += 1
 
             else:  # target_type == "object"
                 pred_object = self.classify_image(img, domain="object")
                 pred_style = self.classify_image(img, domain="style")
 
                 if gt_object == target_concept:
+                    # Target object image -> UA only.
                     results["target_total"] += 1
                     if pred_object == target_concept:
                         results["target_correct"] += 1
                 else:
+                    # Non-target object -> IRA (object) + CRA (style).
                     results["ira_total"] += 1
                     if pred_object == gt_object:
                         results["ira_correct"] += 1
-
-                results["cra_total"] += 1
-                if pred_style == gt_style:
-                    results["cra_correct"] += 1
+                    results["cra_total"] += 1
+                    if pred_style == gt_style:
+                        results["cra_correct"] += 1
 
             # Progress log every 50 images
             if (i + 1) % 50 == 0:
@@ -2009,7 +2015,7 @@ print("✓ FLUX pipeline loaded")
 # TARGET_CONCEPT / TARGET_TYPE are defined here so STEERING_MODE can be
 # auto-selected. The full experiment block (BETA / TOP_FRAC / STEP_RANGE /
 # CLIP_CAP) lives further down -- the values below are the canonical ones.
-TARGET_CONCEPT = "Dog"        # Concept to unlearn (e.g., "Dog", "Van_Gogh")
+TARGET_CONCEPT = "Dogs"       # Concept to unlearn (e.g., "Dogs", "Van_Gogh")
 TARGET_TYPE = "object"        # "style" or "object"
 
 # Mode selection:
@@ -2565,6 +2571,32 @@ else:
     print(f"# {len(CONCEPTS_TO_EVAL)} target concepts x {len(STYLES)*len(OBJECTS)*len(EVAL_SEEDS)} eval images each")
     print(f"#{'#'*69}")
 
+    # ----------------------------------------------------------------------
+    # Pre-generate the SHARED unsteered baseline grid for FID.
+    # Unsteered FLUX outputs depend only on (prompt, seed), not on the
+    # target concept — so one grid is reused as the FID reference for
+    # every concept in the sweep. Resume-safe: existing files are skipped.
+    # ----------------------------------------------------------------------
+    SHARED_BASELINE_DIR = os.path.join(BASELINE_DIR, "_shared_grid")
+    os.makedirs(SHARED_BASELINE_DIR, exist_ok=True)
+    expected = len(STYLES) * len(OBJECTS) * len(EVAL_SEEDS)
+    have = len([f for f in os.listdir(SHARED_BASELINE_DIR) if f.endswith(".jpg")])
+    if have < expected:
+        print(f"\nGenerating shared unsteered baseline grid "
+              f"({have}/{expected} present)...")
+        steerer.pipe.to(steerer.device)
+        for style in tqdm(STYLES, desc="Baselines"):
+            for obj in OBJECTS:
+                for seed in EVAL_SEEDS:
+                    fp = os.path.join(SHARED_BASELINE_DIR,
+                                      f"{style}_{obj}_seed{seed}.jpg")
+                    if not os.path.exists(fp):
+                        prompt = f"A {obj} image in {style.replace('_', ' ')} style."
+                        steerer.generate(prompt, seed, vectors=None).save(fp)
+        print(f"Shared baselines ready: {SHARED_BASELINE_DIR}")
+    else:
+        print(f"Shared baselines already complete: {SHARED_BASELINE_DIR}")
+
     for c_idx, concept in enumerate(CONCEPTS_TO_EVAL):
         print(f"\n{'#'*70}")
         print(f"# [{c_idx+1}/{len(CONCEPTS_TO_EVAL)}] EVALUATING: {concept}")
@@ -2609,25 +2641,21 @@ else:
             clip_cap=CLIP_CAP,
             eval_seeds=EVAL_SEEDS,
             save_images=True,
-            generate_baselines=(c_idx == 0),
+            generate_baselines=False,  # shared grid above handles FID baselines
         )
 
         # ------------------------------------------------------------------
         # Quality metrics: FID + CLIP Score for this concept.
-        # FID compares the steered output dir against the unsteered baseline
-        # dir (UnlearnCanvas paper protocol).
+        # FID compares this concept's steered grid against the SHARED
+        # unsteered baseline grid (concept-independent reference set).
         # ------------------------------------------------------------------
         steered_dir = os.path.join(STEERED_DIR, f"{concept}_{steerer.mode}")
-        baseline_dir_concept = os.path.join(BASELINE_DIR, concept)
 
         fid_score = None
-        if os.path.isdir(baseline_dir_concept) and len(os.listdir(baseline_dir_concept)) > 0:
-            try:
-                fid_score = quality_metrics.calculate_fid(
-                    steered_dir, baseline_dir_concept
-                )
-            except Exception as e:
-                print(f"  ⚠ FID failed: {e}")
+        try:
+            fid_score = quality_metrics.calculate_fid(steered_dir, SHARED_BASELINE_DIR)
+        except Exception as e:
+            print(f"  ⚠ FID failed: {e}")
 
         clip_score = None
         try:
@@ -2716,9 +2744,9 @@ vis_seed = EVAL_SEEDS[0]  # same seed used for baseline generation in evaluator
 # Use the same sample configs as evaluate_unlearning's baseline generation
 if TARGET_TYPE == "style":
     vis_configs = [
-        (TARGET_CONCEPT, "Dog"),
-        (TARGET_CONCEPT, "Cat"),
-        (TARGET_CONCEPT, "Bird"),
+        (TARGET_CONCEPT, "Dogs"),
+        (TARGET_CONCEPT, "Cats"),
+        (TARGET_CONCEPT, "Birds"),
     ]
 else:
     vis_configs = [
