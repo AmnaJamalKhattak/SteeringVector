@@ -17,9 +17,16 @@ Key adaptations vs FLUX:
   * GUIDANCE_SCALE = 4.0 (lower than default 7.0 to let steering compete
     with the prompt-following force amplified by CFG; CFG=7 multiplies
     the conditional pathway 7x, partly undoing upstream steering)
-  * Pooled embedding is 2048-d (CLIP-L 768 + CLIP-G 1280 concatenated)
-  * context_embedder output is (B, 333, 3072): first 77 tokens are
-    CLIP-L+G concatenated and projected; next 256 tokens are T5 projected
+  * Pooled embedding is 2048-d (CLIP-L pooled 768 + CLIP-G pooled 1280
+    concatenated, NOT projected at this stage; projection happens inside
+    time_text_embed.text_embedder)
+  * context_embedder is a plain nn.Linear(joint_attention_dim=4096,
+    caption_projection_dim). Output is (B, 333, caption_projection_dim)
+    where 333 = 77 (CLIP-L+G) + 256 (T5) tokens. caption_projection_dim
+    depends on the checkpoint:
+       SD3 / SD3.5-medium : 1536 (24 heads x 64 dim)
+       SD3.5-large        : 2432 (38 heads x 64 dim)
+    The code reads this dynamically from activations -- no hardcoding.
   * Steering applied ONLY to the conditional batch position (out[1:]),
     not to the unconditional reference frame -- otherwise CFG arithmetic
     is corrupted and the steering effect partially cancels.
@@ -196,8 +203,12 @@ ARCHITECTURE NOTES (vs FLUX):
     * T5     (256 tok x 4096d sequence)
   Pooled vector concatenates [CLIP-L pooled (768)] + [CLIP-G pooled (1280)]
   -> 2048d, fed to time_text_embed.
-  Sequence context: CLIP-L+G concat (77 tok) + T5 projected (256 tok)
-  -> context_embedder -> (333 tok x 3072d) for joint attention.
+  Sequence context: CLIP-L+G concat (77 tok x 4096d) + T5 (256 tok x 4096d)
+  concatenated along token axis (CLIP-then-T5 order, see pipeline source),
+  fed to context_embedder = nn.Linear(4096 -> caption_projection_dim).
+  Output: (B, 333, caption_projection_dim) where caption_projection_dim is
+  1536 for medium / 2432 for large. The code below reads dimensions
+  dynamically from hook activations.
 
   CFG: SD3.5 is not distilled; runs at guidance_scale ~ 4-7 with batched
   unconditional + conditional. context_embedder fires once per step over
@@ -242,7 +253,7 @@ class SD35Steering:
             "pincer_v2": (
                 f"  - STYLE recipe (single direction over time):\n"
                 f"  - Pooled (2048d) -> pre-hook on time_text_embed (low/zero beta)\n"
-                f"  - Sequence (333 tok x 3072d) -> output hook with single mean direction\n"
+                f"  - Sequence (333 tok x caption_projection_dim) -> output hook with single mean direction\n"
                 f"    First 77 tokens = CLIP-L+G; next 256 = T5\n"
                 f"  - Steers only conditional batch (out[1:]) under CFG\n"
                 f"  - {n_blocks} MMDiT blocks present (not directly hooked)"
@@ -250,7 +261,7 @@ class SD35Steering:
             "pincer_perstep": (
                 f"  - OBJECT recipe (per-step directions):\n"
                 f"  - Pooled (2048d) -> pre-hook on time_text_embed (high beta)\n"
-                f"  - Sequence (333 tok x 3072d) -> per-step output hooks ({self.n_steps} directions)\n"
+                f"  - Sequence (333 tok x caption_projection_dim) -> per-step output hooks ({self.n_steps} directions)\n"
                 f"    First 77 tokens = CLIP-L+G; next 256 = T5\n"
                 f"  - Steers only conditional batch (out[1:]) under CFG\n"
                 f"  - Total vectors: pooled (1) + sequence ({self.n_steps})"
@@ -315,9 +326,10 @@ class SD35Steering:
 
         For each (positive, negative) prompt pair (CASteer Appendix C format):
           * Run the pipeline once for positive, once for negative (same seed).
-          * Hook context_embedder OUTPUT to record the (333, 3072) sequence
-            activation at every denoising step. Only the CONDITIONAL position
-            (batch index 1 under CFG) is recorded.
+          * Hook context_embedder OUTPUT to record the (333, D) sequence
+            activation at every denoising step, where D = caption_projection_dim
+            (1536 for SD3.5-medium, 2432 for SD3.5-large). Only the CONDITIONAL
+            position (batch index 1 under CFG) is recorded.
           * Hook time_text_embed PRE to record the 2048d pooled embedding
             (conditional position only).
         After all N pairs:
@@ -331,8 +343,8 @@ class SD35Steering:
         Returns dict matching FLUX's convention but with SD3.5 keys:
           {
             "pooled_2048": {0: direction(2048,)},
-            "ctx_clip":    {step: direction(3072,)},   # over CLIP 77-token region
-            "ctx_t5":      {step: direction(3072,)},   # over T5 256-token region
+            "ctx_clip":    {step: direction(caption_projection_dim,)},   # over CLIP 77-token region
+            "ctx_t5":      {step: direction(caption_projection_dim,)},   # over T5 256-token region
           }
         """
         n_pairs = len(prompt_pairs)
@@ -939,6 +951,44 @@ print("✓ UnlearnCanvasEvaluator class defined!")
 print("\nLoading SD3.5 pipeline...")
 pipe = StableDiffusion3Pipeline.from_pretrained(MODEL_ID, torch_dtype=DTYPE).to(DEVICE)
 print(f"✓ SD3.5 pipeline loaded ({MODEL_ID})")
+
+# ----------------------------------------------------------------------
+# Architecture probe -- assert the layout this file's hooks rely on.
+# Verified against diffusers main branch (Nov 2024):
+#   src/diffusers/models/transformers/transformer_sd3.py
+#   src/diffusers/models/embeddings.py (CombinedTimestepTextProjEmbeddings)
+#   src/diffusers/pipelines/stable_diffusion_3/pipeline_stable_diffusion_3.py
+# ----------------------------------------------------------------------
+print("\nArchitecture probe:")
+_t = pipe.transformer
+_caption_dim = _t.config.caption_projection_dim
+_n_layers = len(_t.transformer_blocks)
+_pooled_dim = _t.config.pooled_projection_dim
+print(f"  caption_projection_dim : {_caption_dim}     "
+      f"(expected: 1536 medium / 2432 large)")
+print(f"  pooled_projection_dim  : {_pooled_dim}     "
+      f"(expected: 2048 = CLIP-L 768 + CLIP-G 1280)")
+print(f"  num_transformer_blocks : {_n_layers}        "
+      f"(expected: 24 medium / 38 large)")
+print(f"  context_embedder       : {type(_t.context_embedder).__name__}  "
+      f"(expected: Linear)")
+print(f"  time_text_embed        : {type(_t.time_text_embed).__name__}  "
+      f"(expected: CombinedTimestepTextProjEmbeddings)")
+
+assert _pooled_dim == 2048, (
+    f"pooled_projection_dim={_pooled_dim} != 2048; the pooled hook assumes "
+    f"a 2048-d concatenated [CLIP-L||CLIP-G] vector. Aborting before "
+    f"running steering.")
+assert isinstance(_t.context_embedder, torch.nn.Linear), (
+    f"context_embedder is {type(_t.context_embedder).__name__}, expected "
+    f"nn.Linear. The output-hook math assumes a single Linear projection.")
+assert _t.context_embedder.in_features == 4096, (
+    f"context_embedder.in_features={_t.context_embedder.in_features} != 4096; "
+    f"this code assumes joint_attention_dim=4096 as input.")
+assert _t.context_embedder.out_features == _caption_dim, (
+    f"context_embedder.out_features={_t.context_embedder.out_features} != "
+    f"caption_projection_dim={_caption_dim}.")
+print(f"  ✓ all architectural assumptions hold")
 
 # ===== EXPERIMENT TARGET =====
 TARGET_CONCEPT = "Dogs"        # plural form to match TRACE
