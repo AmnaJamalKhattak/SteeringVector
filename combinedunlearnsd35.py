@@ -563,18 +563,22 @@ class SD35Steering:
                 out = output.clone()
 
                 # CLIP region: first 77 tokens
-                d_clip = layer_clip_vecs.get(step) or layer_clip_vecs.get(0)
+                d_clip = layer_clip_vecs.get(step)
+                if d_clip is None:
+                    d_clip = layer_clip_vecs.get(0)
                 if d_clip is not None:
                     d = d_clip.to(out.device, out.dtype)
-                    cond_clip = out[cond_idx, :77]   # (77, 3072)
+                    cond_clip = out[cond_idx, :77]   # (77, D)
                     score = cond_clip @ d            # (77,)
                     if clip_negative:
                         score = score.clamp(min=0.0)
-                    update = (b_clip_local * score).unsqueeze(-1) * d  # (77, 3072)
+                    update = (b_clip_local * score).unsqueeze(-1) * d  # (77, D)
                     out[cond_idx, :77] = cond_clip - update
 
                 # T5 region: tokens 77..333
-                d_t5 = layer_t5_vecs.get(step) or layer_t5_vecs.get(0)
+                d_t5 = layer_t5_vecs.get(step)
+                if d_t5 is None:
+                    d_t5 = layer_t5_vecs.get(0)
                 if d_t5 is not None:
                     d = d_t5.to(out.device, out.dtype)
                     cond_t5 = out[cond_idx, 77:333]
