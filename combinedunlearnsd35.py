@@ -1113,21 +1113,62 @@ baseline_img = steerer.generate(DIAG_PROMPT, DIAG_SEED, vectors=None)
 # Sweep beta strengths. If diagnostic showed e.g. pooled_clipL dominates,
 # the user should adjust these configs to vary just pooled_clipL.
 if STEERING_MODE == "pincer_perstep":
+    # OBJECT: identity is redundant across encoders per the Cell 6.5
+    # diagnostic. Joint multi-subspace steering is required. Single-subspace
+    # controls are included to verify the diagnostic prediction (each should
+    # fail to remove the dog on its own).
     configs = [
-        ("low",    {"pooled_clipL": 3, "pooled_clipG": 3, "ctx_clip": 3, "ctx_t5": 3}, True, (0, N_STEPS), None),
-        ("mid",    {"pooled_clipL": 8, "pooled_clipG": 8, "ctx_clip": 5, "ctx_t5": 5}, True, (0, N_STEPS), None),
-        ("high",   {"pooled_clipL": 15, "pooled_clipG": 15, "ctx_clip": 8, "ctx_t5": 8}, True, (0, N_STEPS), None),
-        ("clipL_only", {"pooled_clipL": 15, "pooled_clipG": 0, "ctx_clip": 0, "ctx_t5": 0}, True, (0, N_STEPS), None),
-        ("clipG_only", {"pooled_clipL": 0, "pooled_clipG": 15, "ctx_clip": 0, "ctx_t5": 0}, True, (0, N_STEPS), None),
-        ("t5_only",    {"pooled_clipL": 0, "pooled_clipG": 0, "ctx_clip": 0, "ctx_t5": 8}, True, (0, N_STEPS), None),
+        # Joint recipes -- the predicted-to-work approach, varying strength.
+        ("joint_low",
+         {"pooled_clipL": 2.0, "pooled_clipG": 4.0, "ctx_clip": 4.0, "ctx_t5": 1.0},
+         True, (0, N_STEPS), None),
+        ("joint_mid",
+         {"pooled_clipL": 4.0, "pooled_clipG": 8.0, "ctx_clip": 8.0, "ctx_t5": 2.0},
+         True, (0, N_STEPS), None),
+        ("joint_high",
+         {"pooled_clipL": 6.0, "pooled_clipG": 12.0, "ctx_clip": 12.0, "ctx_t5": 3.0},
+         True, (0, N_STEPS), None),
+        ("joint_max",
+         {"pooled_clipL": 8.0, "pooled_clipG": 15.0, "ctx_clip": 15.0, "ctx_t5": 4.0},
+         True, (0, N_STEPS), None),
+
+        # Single-subspace controls -- diagnostic predicts these should NOT
+        # destroy the dog (other encoders compensate). If any of these alone
+        # successfully unlearns Dogs, that's a surprising / important finding.
+        ("clipG_only_strong",
+         {"pooled_clipL": 0.0, "pooled_clipG": 20.0, "ctx_clip": 0.0, "ctx_t5": 0.0},
+         True, (0, N_STEPS), None),
+        ("ctx_clip_only_strong",
+         {"pooled_clipL": 0.0, "pooled_clipG": 0.0, "ctx_clip": 20.0, "ctx_t5": 0.0},
+         True, (0, N_STEPS), None),
     ]
 else:
+    # STYLE: ctx_clip dominates per the Cell 6.5 diagnostic
+    # (zero_seq_clip_region and zero_ctx_out_clip both destroyed Van Gogh).
+    # ctx_clip-only at varying strengths is the recipe; T5 and pooled
+    # controls are included to verify they add little / nothing.
     configs = [
-        ("clip_only_low",  {"ctx_clip": 3, "ctx_t5": 0}, True, (0, N_STEPS), 1.0),
-        ("clip_only_high", {"ctx_clip": 8, "ctx_t5": 0}, True, (0, N_STEPS), 1.0),
-        ("t5_only_low",    {"ctx_clip": 0, "ctx_t5": 3}, True, (0, N_STEPS), 1.0),
-        ("t5_only_high",   {"ctx_clip": 0, "ctx_t5": 8}, True, (0, N_STEPS), 1.0),
-        ("both",           {"ctx_clip": 4, "ctx_t5": 6}, True, (0, N_STEPS), 1.0),
+        # The recipe: ctx_clip-only at increasing strength.
+        ("clip_only_low",
+         {"pooled_clipL": 0.0, "pooled_clipG": 0.0, "ctx_clip": 4.0,  "ctx_t5": 0.0},
+         True, (0, N_STEPS), 1.0),
+        ("clip_only_mid",
+         {"pooled_clipL": 0.0, "pooled_clipG": 0.0, "ctx_clip": 8.0,  "ctx_t5": 0.0},
+         True, (0, N_STEPS), 1.0),
+        ("clip_only_high",
+         {"pooled_clipL": 0.0, "pooled_clipG": 0.0, "ctx_clip": 12.0, "ctx_t5": 0.0},
+         True, (0, N_STEPS), 1.0),
+
+        # Controls. Diagnostic predicts these add little or nothing.
+        ("t5_only",
+         {"pooled_clipL": 0.0, "pooled_clipG": 0.0, "ctx_clip": 0.0, "ctx_t5": 8.0},
+         True, (0, N_STEPS), 1.0),
+        ("clip_plus_t5",
+         {"pooled_clipL": 0.0, "pooled_clipG": 0.0, "ctx_clip": 8.0, "ctx_t5": 4.0},
+         True, (0, N_STEPS), 1.0),
+        ("clip_plus_pool",
+         {"pooled_clipL": 2.0, "pooled_clipG": 4.0, "ctx_clip": 8.0, "ctx_t5": 0.0},
+         True, (0, N_STEPS), 1.0),
     ]
 
 test_images = []
