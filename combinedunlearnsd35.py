@@ -179,21 +179,39 @@ print("=" * 70)
 class SD35Steering:
     """Architecture-aware concept steering for Stable Diffusion 3.5 (MMDiT).
 
-    Four independently-controllable subspaces, each with its own learned
-    direction and its own beta:
+    FIVE independently-controllable subspaces (one direction per concept,
+    one beta knob each):
 
-      pooled_clipL : 768-d, time_text_embed pooled input slice [0:768]
-                     (CLIP-L pooled embedding, drives AdaLN modulation)
-      pooled_clipG : 1280-d, slice [768:2048]
-                     (CLIP-G pooled embedding, also drives AdaLN)
-      ctx_clip     : context_embedder OUTPUT, first 77 tokens
-                     (CLIP-L+G concatenated joint sequence after projection)
-      ctx_t5       : context_embedder OUTPUT, tokens 77..333
-                     (T5 sequence after projection)
+      pooled_clipL  : 768-d, time_text_embed pooled input slice [0:768]
+                      (CLIP-L pooled, raw, BEFORE the modulation MLP)
+      pooled_clipG  : 1280-d, slice [768:2048]
+                      (CLIP-G pooled, raw, BEFORE the modulation MLP)
+      tte_out       : caption_projection_dim, time_text_embed OUTPUT
+                      (= the AdaLN modulation signal AFTER the SiLU MLP).
+                      TRACE Appendix D.1: "Despite operating on a pooled
+                      representation, we found it necessary to intervene at
+                      this layer as well to ensure effective suppression".
+                      This is the layer SD3.5 needs that FLUX doesn't --
+                      because SD3.5's modulation MLP nonlinearly mixes the
+                      input, so subtracting at the input doesn't cleanly
+                      remove the concept downstream.
+      ctx_clip      : context_embedder OUTPUT, first 77 tokens
+                      (CLIP-L+G concatenated joint sequence after projection)
+      ctx_t5        : context_embedder OUTPUT, tokens 77..333
+                      (T5 sequence after projection)
+
+    Modes (parallel to FLUX):
+      pincer_v2      -- style : single time-averaged direction per subspace
+      pincer_perstep -- object: per-step directions per subspace
+
+    CFG handling: under classifier-free guidance the transformer runs with
+    batch=2 (uncond at index 0, cond at index 1). All steering hooks apply
+    ONLY to the conditional position (index 1). Touching the uncond branch
+    contaminates the CFG reference frame and partially undoes the steering.
 
     Use diagnose() before tuning betas to find which subspaces matter for
-    your concept. Steering blindly without that step is the bug we keep
-    repeating.
+    your concept. Diagnostic now includes zeroing tte_out so we can verify
+    TRACE's finding on our specific setup.
     """
 
     VALID_MODES = ("pincer_v2", "pincer_perstep")
@@ -223,8 +241,12 @@ class SD35Steering:
         print(f"  caption_projection_dim : {self.caption_dim}")
         print(f"  pooled split           : CLIP-L [0:768] + CLIP-G [768:2048]")
         print(f"  ctx split              : CLIP region [0:77] + T5 region [77:333]")
+        print(f"  tte_out (NEW)          : modulation signal after SiLU MLP")
+        print(f"                           dim = caption_projection_dim ({self.caption_dim})")
         print(f"  transformer blocks     : {n_blocks}")
         print(f"  Run diagnose() FIRST to identify which subspaces matter.")
+        print(f"  TRACE App. D.1 says SD3.5 needs intervention at the modulation MLP.")
+        print(f"  Our previous file missed this -- now added as 'tte_out' subspace.")
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -273,22 +295,29 @@ class SD35Steering:
     @torch.no_grad()
     def diagnose(self, prompt, seed):
         """
-        Generate baseline + 7 zeroing variants for a single (prompt, seed).
+        Generate baseline + 8 zeroing variants for a single (prompt, seed).
         Each variant zeroes a specific subspace. Comparing the resulting
         images reveals which subspace carries which kind of information.
 
         Returns: dict {label: PIL.Image}.
 
-        Recommended interpretation:
-          baseline                : reference image
-          zero_pooled_all         : if image collapses, pooled-modulation is critical
-          zero_pooled_clipL       : if dog disappears, CLIP-L pooled carries object id
-          zero_pooled_clipG       : if dog disappears, CLIP-G pooled carries object id
-                                    (compare to clipL to see which dominates)
-          zero_seq_clip_region    : if style/composition change, sequence CLIP carries that
-          zero_seq_t5             : if style/text-following changes, T5 carries that
-          zero_ctx_out_clip       : same as zero_seq_clip but at OUTPUT of context_embedder
-          zero_ctx_out_t5         : same as zero_seq_t5 but at OUTPUT
+        Interpretation:
+          baseline             : reference
+          zero_pooled_all      : zeros pooled INPUT to time_text_embed (pre-MLP)
+          zero_pooled_clipL    : zeros only CLIP-L pooled slice [0:768]
+          zero_pooled_clipG    : zeros only CLIP-G pooled slice [768:2048]
+          zero_tte_out  (NEW)  : zeros the OUTPUT of time_text_embed (post-MLP)
+                                 -- the actual AdaLN modulation signal. Per
+                                 TRACE App. D.1, this is the layer that
+                                 needs intervention on SD3.5.
+          zero_seq_clip_region : zeros first 77 tokens of context_embedder INPUT
+          zero_seq_t5          : zeros tokens 77..333 of context_embedder INPUT
+          zero_ctx_out_clip    : zeros first 77 tokens of context_embedder OUTPUT
+          zero_ctx_out_t5      : zeros tokens 77..333 of context_embedder OUTPUT
+
+        If zero_tte_out destroys the dog while zero_pooled_all does not, that
+        confirms TRACE's finding empirically -- the modulation MLP's output
+        carries concept signal that the input perturbation alone misses.
         """
         def make_pre_pooled(slice_a, slice_b):
             def hook(module, args):
@@ -318,6 +347,16 @@ class SD35Steering:
                 return out
             return hook
 
+        def make_post_tte_output():
+            """Zero time_text_embed OUTPUT (= AdaLN modulation signal).
+            This is the post-MLP, post-SiLU signal -- TRACE's finding."""
+            def hook(module, inputs, output):
+                out = output.clone()   # (B, caption_dim)
+                cond_idx = 1 if out.shape[0] >= 2 else 0
+                out[cond_idx, :] = 0
+                return out
+            return hook
+
         # Each experiment is a list of hooks to register.
         experiments = [
             ("baseline",            []),
@@ -327,6 +366,9 @@ class SD35Steering:
                                       make_pre_pooled(0, 768))]),
             ("zero_pooled_clipG",   [("time_text_embed", "pre",
                                       make_pre_pooled(768, 2048))]),
+            # NEW: zero the modulation MLP's OUTPUT (TRACE finding)
+            ("zero_tte_out",        [("time_text_embed", "post",
+                                      make_post_tte_output())]),
             ("zero_seq_clip_region", [("context_embedder", "pre",
                                       make_pre_ctx_input(0, 77))]),
             ("zero_seq_t5",         [("context_embedder", "pre",
@@ -384,10 +426,13 @@ class SD35Steering:
 
         ctx_clip_acc = {step: None for step in range(self.n_steps)}
         ctx_t5_acc   = {step: None for step in range(self.n_steps)}
+        # NEW: per-step accumulator for time_text_embed OUTPUT (modulation signal)
+        tte_out_acc  = {step: None for step in range(self.n_steps)}
         pooled_acc = None
 
         cap_ctx = {}    # {step: (333, caption_dim)}
         cap_pooled = {}
+        cap_tte = {}    # {step: (caption_dim,)} -- NEW
 
         def _ctx_hook(module, inp, out):
             step = self._current_step + 1
@@ -401,19 +446,30 @@ class SD35Steering:
                 cond_idx = 1 if pooled.shape[0] >= 2 else 0
                 cap_pooled["pooled"] = pooled[cond_idx].detach().float().cpu()
 
+        def _tte_post_hook(module, inp, out):
+            """Capture time_text_embed OUTPUT (the post-MLP modulation signal).
+            Per TRACE App. D.1, this is the layer SD3.5 needs intervention on."""
+            step = self._current_step + 1
+            if 0 <= step < self.n_steps:
+                cond_idx = 1 if out.shape[0] >= 2 else 0
+                cap_tte[step] = out[cond_idx].detach().float().cpu()
+
         def _capture(prompt, seed_):
             cap_ctx.clear()
             cap_pooled.clear()
+            cap_tte.clear()
             self._clear_hooks()
             self._handles.append(
                 self.target_layers["context_embedder"].register_forward_hook(_ctx_hook))
             self._handles.append(
                 self.target_layers["time_text_embed"].register_forward_pre_hook(_pooled_pre_hook))
+            self._handles.append(
+                self.target_layers["time_text_embed"].register_forward_hook(_tte_post_hook))
             try:
                 self._run_pipe_base(prompt, seed_)
             finally:
                 self._clear_hooks()
-            return dict(cap_ctx), cap_pooled.get("pooled")
+            return dict(cap_ctx), cap_pooled.get("pooled"), dict(cap_tte)
 
         for pair_idx, (pos_p, neg_p) in enumerate(
             tqdm(prompt_pairs, desc="Diverse pairs", disable=not verbose)
@@ -423,33 +479,37 @@ class SD35Steering:
             neg_clip_mask = self._get_clip_l_mask(neg_p)
             neg_t5_mask   = self._get_t5_mask(neg_p)
 
-            pos_ctx, pos_pooled = _capture(pos_p, seed)
-            neg_ctx, neg_pooled = _capture(neg_p, seed)
+            pos_ctx, pos_pooled, pos_tte = _capture(pos_p, seed)
+            neg_ctx, neg_pooled, neg_tte = _capture(neg_p, seed)
 
             for step in range(self.n_steps):
-                if step not in pos_ctx or step not in neg_ctx:
-                    continue
-                pos_seq = pos_ctx[step]
-                neg_seq = neg_ctx[step]
-                seq_len = min(pos_seq.shape[0], neg_seq.shape[0])
-                pos_seq = pos_seq[:seq_len]
-                neg_seq = neg_seq[:seq_len]
+                if step in pos_ctx and step in neg_ctx:
+                    pos_seq = pos_ctx[step]
+                    neg_seq = neg_ctx[step]
+                    seq_len = min(pos_seq.shape[0], neg_seq.shape[0])
+                    pos_seq = pos_seq[:seq_len]
+                    neg_seq = neg_seq[:seq_len]
 
-                # CLIP region (first 77 tokens), masked mean
-                pos_clip_pool = self._masked_mean(
-                    pos_seq[:77].unsqueeze(0), pos_clip_mask)
-                neg_clip_pool = self._masked_mean(
-                    neg_seq[:77].unsqueeze(0), neg_clip_mask)
-                d_clip = pos_clip_pool - neg_clip_pool
-                ctx_clip_acc[step] = d_clip if ctx_clip_acc[step] is None else ctx_clip_acc[step] + d_clip
+                    # CLIP region (first 77 tokens), masked mean
+                    pos_clip_pool = self._masked_mean(
+                        pos_seq[:77].unsqueeze(0), pos_clip_mask)
+                    neg_clip_pool = self._masked_mean(
+                        neg_seq[:77].unsqueeze(0), neg_clip_mask)
+                    d_clip = pos_clip_pool - neg_clip_pool
+                    ctx_clip_acc[step] = d_clip if ctx_clip_acc[step] is None else ctx_clip_acc[step] + d_clip
 
-                # T5 region (tokens 77..333), masked mean
-                pos_t5_pool = self._masked_mean(
-                    pos_seq[77:77 + 256].unsqueeze(0), pos_t5_mask)
-                neg_t5_pool = self._masked_mean(
-                    neg_seq[77:77 + 256].unsqueeze(0), neg_t5_mask)
-                d_t5 = pos_t5_pool - neg_t5_pool
-                ctx_t5_acc[step] = d_t5 if ctx_t5_acc[step] is None else ctx_t5_acc[step] + d_t5
+                    # T5 region (tokens 77..333), masked mean
+                    pos_t5_pool = self._masked_mean(
+                        pos_seq[77:77 + 256].unsqueeze(0), pos_t5_mask)
+                    neg_t5_pool = self._masked_mean(
+                        neg_seq[77:77 + 256].unsqueeze(0), neg_t5_mask)
+                    d_t5 = pos_t5_pool - neg_t5_pool
+                    ctx_t5_acc[step] = d_t5 if ctx_t5_acc[step] is None else ctx_t5_acc[step] + d_t5
+
+                # tte_out diff per step (NEW)
+                if step in pos_tte and step in neg_tte:
+                    d_tte = pos_tte[step] - neg_tte[step]
+                    tte_out_acc[step] = d_tte if tte_out_acc[step] is None else tte_out_acc[step] + d_tte
 
             if pos_pooled is not None and neg_pooled is not None:
                 d_pool = pos_pooled - neg_pooled
@@ -468,18 +528,22 @@ class SD35Steering:
             vectors["pooled_clipL"] = {0: (clipL / (clipL.norm() + 1e-8)).to(self.device, dtype=DTYPE)}
             vectors["pooled_clipG"] = {0: (clipG / (clipG.norm() + 1e-8)).to(self.device, dtype=DTYPE)}
 
-        # ctx directions
+        # ctx directions + tte_out directions (per-step or single, by mode)
         if self.mode == "pincer_v2":
             valid_clip = [v for v in ctx_clip_acc.values() if v is not None]
             valid_t5   = [v for v in ctx_t5_acc.values() if v is not None]
+            valid_tte  = [v for v in tte_out_acc.values() if v is not None]
             if valid_clip:
                 avg = sum(valid_clip) / (len(valid_clip) * n_pairs)
                 vectors["ctx_clip"] = {0: (avg / (avg.norm() + 1e-8)).to(self.device, dtype=DTYPE)}
             if valid_t5:
                 avg = sum(valid_t5) / (len(valid_t5) * n_pairs)
                 vectors["ctx_t5"]   = {0: (avg / (avg.norm() + 1e-8)).to(self.device, dtype=DTYPE)}
+            if valid_tte:
+                avg = sum(valid_tte) / (len(valid_tte) * n_pairs)
+                vectors["tte_out"]  = {0: (avg / (avg.norm() + 1e-8)).to(self.device, dtype=DTYPE)}
         else:
-            ctx_clip_dirs, ctx_t5_dirs = {}, {}
+            ctx_clip_dirs, ctx_t5_dirs, tte_out_dirs = {}, {}, {}
             for step in range(self.n_steps):
                 if ctx_clip_acc[step] is not None:
                     avg = ctx_clip_acc[step] / n_pairs
@@ -487,8 +551,12 @@ class SD35Steering:
                 if ctx_t5_acc[step] is not None:
                     avg = ctx_t5_acc[step] / n_pairs
                     ctx_t5_dirs[step] = (avg / (avg.norm() + 1e-8)).to(self.device, dtype=DTYPE)
+                if tte_out_acc[step] is not None:
+                    avg = tte_out_acc[step] / n_pairs
+                    tte_out_dirs[step] = (avg / (avg.norm() + 1e-8)).to(self.device, dtype=DTYPE)
             vectors["ctx_clip"] = ctx_clip_dirs
             vectors["ctx_t5"]   = ctx_t5_dirs
+            vectors["tte_out"]  = tte_out_dirs
 
         if verbose:
             print(f"\n{'='*70}")
@@ -507,8 +575,14 @@ class SD35Steering:
     @contextmanager
     def apply_vectors(self, vectors, beta=2.0, clip_negative=True,
                       step_range=None, clip_cap=None):
-        """Apply steering. beta can be a single float (used for all subspaces)
-        or a dict with any subset of {pooled_clipL, pooled_clipG, ctx_clip, ctx_t5}.
+        """Apply steering. beta can be a single float (applied to all subspaces)
+        or a dict with any subset of:
+          {pooled_clipL, pooled_clipG, tte_out, ctx_clip, ctx_t5}
+
+        tte_out (NEW) steers the OUTPUT of time_text_embed -- the AdaLN
+        modulation signal after the SiLU MLP. Per TRACE App. D.1, this is
+        the layer SD3.5 needs intervention on; subtracting at the input
+        only doesn't propagate cleanly through the MLP nonlinearity.
 
         Subspaces with beta=0 (or missing from vectors) are not steered.
         Steering applies ONLY to the conditional batch position under CFG.
@@ -516,10 +590,11 @@ class SD35Steering:
         if isinstance(beta, dict):
             b_clipL = beta.get("pooled_clipL", 0.0)
             b_clipG = beta.get("pooled_clipG", 0.0)
+            b_tte   = beta.get("tte_out", 0.0)
             b_ctx_clip = beta.get("ctx_clip", 0.0)
             b_ctx_t5   = beta.get("ctx_t5", 0.0)
         else:
-            b_clipL = b_clipG = b_ctx_clip = b_ctx_t5 = float(beta)
+            b_clipL = b_clipG = b_tte = b_ctx_clip = b_ctx_t5 = float(beta)
 
         if step_range is None:
             def _in_range(step): return True
@@ -606,9 +681,38 @@ class SD35Steering:
                 return out
             return hook
 
+        def make_tte_post_hook(layer_vecs, b):
+            """Post-hook on time_text_embed: subtract the dog direction from
+            the post-MLP modulation signal of the conditional position.
+            This is the TRACE-aligned intervention that SD3.5 needs."""
+            def hook(module, inputs, output):
+                step = self._current_step + 1
+                if not _in_range(step):
+                    return output
+                cond_idx = 1 if output.shape[0] >= 2 else 0
+                d_tte = layer_vecs.get(step)
+                if d_tte is None:
+                    d_tte = layer_vecs.get(0)
+                if d_tte is None:
+                    return output
+                out = output.clone()
+                d = d_tte.to(out.device, out.dtype)
+                cond = out[cond_idx]
+                score = cond @ d
+                if clip_negative:
+                    score = score.clamp(min=0.0)
+                if clip_cap is None:
+                    eff = float(b) * score
+                else:
+                    eff = min(float(b), float(clip_cap)) * score
+                out[cond_idx] = cond - eff * d
+                return out
+            return hook
+
         try:
             self._clear_hooks()
 
+            # Pre-hook on time_text_embed input: pooled CLIP-L / CLIP-G
             pooled_L = vectors.get("pooled_clipL", {}).get(0)
             pooled_G = vectors.get("pooled_clipG", {}).get(0)
             if (pooled_L is not None and b_clipL > 0) or (pooled_G is not None and b_clipG > 0):
@@ -616,6 +720,15 @@ class SD35Steering:
                     self.target_layers["time_text_embed"].register_forward_pre_hook(
                         make_pooled_hook(pooled_L, b_clipL, pooled_G, b_clipG)))
 
+            # Post-hook on time_text_embed OUTPUT: tte_out (TRACE finding).
+            # This is the AdaLN modulation signal AFTER the SiLU MLP.
+            tte_vecs = vectors.get("tte_out", {})
+            if tte_vecs and b_tte > 0:
+                self._handles.append(
+                    self.target_layers["time_text_embed"].register_forward_hook(
+                        make_tte_post_hook(tte_vecs, b_tte)))
+
+            # Output hook on context_embedder: CLIP / T5 regions.
             ctx_clip_vecs = vectors.get("ctx_clip", {})
             ctx_t5_vecs   = vectors.get("ctx_t5", {})
             if (ctx_clip_vecs and b_ctx_clip > 0) or (ctx_t5_vecs and b_ctx_t5 > 0):
@@ -1038,24 +1151,29 @@ Defaults below are starting points. ADJUST based on Cell 6.5 findings:
     style unlearning.
 """
 if TARGET_TYPE == "style":
-    # Style is typically text-sequence-driven; T5 is the usual carrier.
+    # Style: previous diagnostic showed ctx_clip is the primary lever.
+    # Adding tte_out as a secondary lever per TRACE finding -- the
+    # modulation signal also encodes some style information.
     BETA = {
         "pooled_clipL": 0.0,
         "pooled_clipG": 0.0,
-        "ctx_clip":     2.0,
-        "ctx_t5":       6.0,
+        "tte_out":      4.0,    # NEW: TRACE-aligned modulation MLP intervention
+        "ctx_clip":     8.0,    # primary lever from diagnostic
+        "ctx_t5":       0.0,    # diagnostic showed T5 doesn't carry style here
     }
     STEP_RANGE = (0, N_STEPS)
     CLIP_CAP = 1.0
 else:
-    # Object identity: pooled tends to dominate (modulation -> AdaLN ->
-    # every block). Both CLIP-L and CLIP-G pooled get nonzero beta initially;
-    # adjust per Cell 6.5.
+    # Object: identity is redundantly distributed. Joint multi-subspace.
+    # tte_out (NEW) is the missing piece that lets steering propagate
+    # through the modulation MLP cleanly -- TRACE App. D.1 says this is
+    # the layer SD3.5 needs intervention on. Initial high beta for it.
     BETA = {
-        "pooled_clipL": 8.0,
-        "pooled_clipG": 8.0,
-        "ctx_clip":     5.0,
-        "ctx_t5":       5.0,
+        "pooled_clipL": 5.0,
+        "pooled_clipG": 10.0,
+        "tte_out":     12.0,    # NEW: post-MLP modulation signal -- the missing lever
+        "ctx_clip":    10.0,
+        "ctx_t5":       2.0,
     }
     STEP_RANGE = (0, N_STEPS)
     CLIP_CAP = None
@@ -1113,61 +1231,75 @@ baseline_img = steerer.generate(DIAG_PROMPT, DIAG_SEED, vectors=None)
 # Sweep beta strengths. If diagnostic showed e.g. pooled_clipL dominates,
 # the user should adjust these configs to vary just pooled_clipL.
 if STEERING_MODE == "pincer_perstep":
-    # OBJECT: identity is redundant across encoders per the Cell 6.5
-    # diagnostic. Joint multi-subspace steering is required. Single-subspace
-    # controls are included to verify the diagnostic prediction (each should
-    # fail to remove the dog on its own).
+    # OBJECT: identity is redundant + needs intervention on the post-MLP
+    # modulation signal (TRACE App. D.1). Configs add tte_out alongside
+    # the previous joint multi-subspace recipes.
     configs = [
-        # Joint recipes -- the predicted-to-work approach, varying strength.
-        ("joint_low",
-         {"pooled_clipL": 2.0, "pooled_clipG": 4.0, "ctx_clip": 4.0, "ctx_t5": 1.0},
+        # tte_out-ONLY tests. If TRACE's finding holds, even a single-
+        # subspace tte_out at moderate beta should remove the dog where
+        # previous single-subspace failed.
+        ("tte_only_mid",
+         {"pooled_clipL": 0.0, "pooled_clipG": 0.0, "tte_out": 10.0,
+          "ctx_clip": 0.0, "ctx_t5": 0.0},
          True, (0, N_STEPS), None),
-        ("joint_mid",
-         {"pooled_clipL": 4.0, "pooled_clipG": 8.0, "ctx_clip": 8.0, "ctx_t5": 2.0},
-         True, (0, N_STEPS), None),
-        ("joint_high",
-         {"pooled_clipL": 6.0, "pooled_clipG": 12.0, "ctx_clip": 12.0, "ctx_t5": 3.0},
-         True, (0, N_STEPS), None),
-        ("joint_max",
-         {"pooled_clipL": 8.0, "pooled_clipG": 15.0, "ctx_clip": 15.0, "ctx_t5": 4.0},
+        ("tte_only_high",
+         {"pooled_clipL": 0.0, "pooled_clipG": 0.0, "tte_out": 20.0,
+          "ctx_clip": 0.0, "ctx_t5": 0.0},
          True, (0, N_STEPS), None),
 
-        # Single-subspace controls -- diagnostic predicts these should NOT
-        # destroy the dog (other encoders compensate). If any of these alone
-        # successfully unlearns Dogs, that's a surprising / important finding.
-        ("clipG_only_strong",
-         {"pooled_clipL": 0.0, "pooled_clipG": 20.0, "ctx_clip": 0.0, "ctx_t5": 0.0},
+        # Joint recipes WITH tte_out. The new full-coverage approach.
+        ("joint_with_tte_low",
+         {"pooled_clipL": 3.0, "pooled_clipG": 6.0, "tte_out": 8.0,
+          "ctx_clip": 6.0, "ctx_t5": 2.0},
          True, (0, N_STEPS), None),
-        ("ctx_clip_only_strong",
-         {"pooled_clipL": 0.0, "pooled_clipG": 0.0, "ctx_clip": 20.0, "ctx_t5": 0.0},
+        ("joint_with_tte_mid",
+         {"pooled_clipL": 5.0, "pooled_clipG": 10.0, "tte_out": 12.0,
+          "ctx_clip": 10.0, "ctx_t5": 2.0},
+         True, (0, N_STEPS), None),
+        ("joint_with_tte_high",
+         {"pooled_clipL": 7.0, "pooled_clipG": 14.0, "tte_out": 18.0,
+          "ctx_clip": 14.0, "ctx_t5": 3.0},
+         True, (0, N_STEPS), None),
+
+        # Old joint recipe (NO tte_out) for comparison. Should fail like before.
+        ("old_joint_no_tte",
+         {"pooled_clipL": 6.0, "pooled_clipG": 12.0, "tte_out": 0.0,
+          "ctx_clip": 12.0, "ctx_t5": 3.0},
          True, (0, N_STEPS), None),
     ]
 else:
-    # STYLE: ctx_clip dominates per the Cell 6.5 diagnostic
-    # (zero_seq_clip_region and zero_ctx_out_clip both destroyed Van Gogh).
-    # ctx_clip-only at varying strengths is the recipe; T5 and pooled
-    # controls are included to verify they add little / nothing.
+    # STYLE: ctx_clip is the primary lever. Adding tte_out as a secondary
+    # lever (TRACE finding); test whether including it helps style as well
+    # as object.
     configs = [
-        # The recipe: ctx_clip-only at increasing strength.
+        # ctx_clip-only (the previous recipe) at increasing strength.
         ("clip_only_low",
-         {"pooled_clipL": 0.0, "pooled_clipG": 0.0, "ctx_clip": 4.0,  "ctx_t5": 0.0},
+         {"pooled_clipL": 0.0, "pooled_clipG": 0.0, "tte_out": 0.0,
+          "ctx_clip": 4.0,  "ctx_t5": 0.0},
          True, (0, N_STEPS), 1.0),
         ("clip_only_mid",
-         {"pooled_clipL": 0.0, "pooled_clipG": 0.0, "ctx_clip": 8.0,  "ctx_t5": 0.0},
+         {"pooled_clipL": 0.0, "pooled_clipG": 0.0, "tte_out": 0.0,
+          "ctx_clip": 8.0,  "ctx_t5": 0.0},
          True, (0, N_STEPS), 1.0),
         ("clip_only_high",
-         {"pooled_clipL": 0.0, "pooled_clipG": 0.0, "ctx_clip": 12.0, "ctx_t5": 0.0},
+         {"pooled_clipL": 0.0, "pooled_clipG": 0.0, "tte_out": 0.0,
+          "ctx_clip": 12.0, "ctx_t5": 0.0},
          True, (0, N_STEPS), 1.0),
 
-        # Controls. Diagnostic predicts these add little or nothing.
-        ("t5_only",
-         {"pooled_clipL": 0.0, "pooled_clipG": 0.0, "ctx_clip": 0.0, "ctx_t5": 8.0},
+        # NEW: ctx_clip + tte_out (the TRACE-aligned style recipe).
+        ("clip_plus_tte_low",
+         {"pooled_clipL": 0.0, "pooled_clipG": 0.0, "tte_out": 3.0,
+          "ctx_clip": 6.0, "ctx_t5": 0.0},
          True, (0, N_STEPS), 1.0),
-        ("clip_plus_t5",
-         {"pooled_clipL": 0.0, "pooled_clipG": 0.0, "ctx_clip": 8.0, "ctx_t5": 4.0},
+        ("clip_plus_tte_mid",
+         {"pooled_clipL": 0.0, "pooled_clipG": 0.0, "tte_out": 5.0,
+          "ctx_clip": 8.0, "ctx_t5": 0.0},
          True, (0, N_STEPS), 1.0),
-        ("clip_plus_pool",
-         {"pooled_clipL": 2.0, "pooled_clipG": 4.0, "ctx_clip": 8.0, "ctx_t5": 0.0},
+
+        # Sanity: tte_out alone for style.
+        ("tte_only_style",
+         {"pooled_clipL": 0.0, "pooled_clipG": 0.0, "tte_out": 8.0,
+          "ctx_clip": 0.0, "ctx_t5": 0.0},
          True, (0, N_STEPS), 1.0),
     ]
 
