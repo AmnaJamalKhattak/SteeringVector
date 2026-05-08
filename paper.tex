@@ -49,26 +49,23 @@ Activation Steering, Concept Unlearning, Diffusion Transformers}
 
 \begin{abstract}
 Activation steering controls model behavior by adding a learned
-direction to hidden states; it is well-studied in LLMs and recently in
-U-Net diffusion models, but has not been characterized for modern
+direction to hidden states; it is well-studied in LLMs and recently
+in U-Net diffusion models, but has not been characterized for modern
 \emph{Diffusion Transformers} (DiTs). We present a training-free
-concept-unlearning framework for DiTs that intervenes at the
-text-conditioning entry points: the CLIP-pooled embedding that drives
-AdaLN modulation and the projected T5 sequence that enters joint
-attention. A simple zeroing diagnostic separates the two roles in
-FLUX---CLIP carries object identity, T5 carries style---and motivates
-two protocols. \emph{Style-Vacuum} subtracts a single T5 direction;
-\emph{Object-Vacuum} subtracts a per-step T5 direction together with
-an uncapped CLIP direction. With per-concept $\beta$ tuning on
-UnlearnCanvas and TRACE-aligned LLaVA classification on FLUX-schnell,
+concept-unlearning framework for DiTs that intervenes only at the
+text-conditioning entry points: the CLIP-pooled embedding feeding
+AdaLN modulation, and the projected T5 sequence entering joint
+attention. A subspace zeroing diagnostic separates the two roles in
+FLUX---CLIP gates object identity, T5 gates style---and motivates two
+protocols. \emph{Style-Vacuum} subtracts a single time-averaged T5
+direction. \emph{Object-Vacuum} subtracts a per-step T5 direction
+together with an uncapped CLIP direction. With per-concept $\beta$
+selection on UnlearnCanvas and TRACE-aligned LLaVA classification,
 the method matches the published FLUX style-removal UA of TRACE
 ($88.9\%$ vs.\ $88.6\%$) and exceeds its FLUX object-removal UA
 ($97.3\%$ vs.\ $93.2\%$) without any retraining. The same recipe does
-not transfer to SD3.5; the diagnostic shows object identity is
-redundantly encoded across encoders, and effective intervention
-appears to require hooking the post-MLP modulation signal, consistent
-with TRACE's transcoder-coverage finding. SD3.5 is treated as a
-limitation.
+not transfer to Stable Diffusion~3.5; we report SD3.5 as a limitation
+and discuss what its diagnostic shows about why.
 \end{abstract}
 
 \section{Introduction}
@@ -82,33 +79,38 @@ unlearning---suppressing specific concepts in the output
 distribution---is a standard safety/IP requirement, but most existing
 methods retrain
 weights~\cite{gandikota2023erasing,kumari2023ablating,gandikota2024unified,tracepaper}
-or were developed for cross-attention U-Nets that no longer hold under
-joint attention~\cite{khrulkov2024casteer}. We ask whether
-inference-time activation steering---which is training-free and
-operates only on activations---can do the same job in a DiT.
+or were developed for cross-attention U-Nets that do not survive joint
+attention~\cite{khrulkov2024casteer}. We ask whether inference-time
+activation steering---training-free, operating only on
+activations---can do the same job in a DiT.
 
-Our answer for FLUX is yes. The key observation is mechanistic: FLUX
-exposes two text-conditioning entry points, and each carries a
-distinct concept type. A diagnostic that zeroes one entry point at a
-time on a fixed prompt cleanly separates the roles: zeroing the
-CLIP-pooled embedding produces noise, while zeroing the T5 path leaves
-the object intact and shifts style. We design two protocols around
-this finding---\emph{Style-Vacuum} and \emph{Object-Vacuum}---and
-evaluate them on the UnlearnCanvas benchmark with the TRACE-paper
-LLaVA classifier. The same recipe does not transfer to SD3.5; the
-diagnostic shows why, and we report this as the main open problem.
+For FLUX, the answer is yes, and the reason is mechanistic. FLUX
+exposes two text-conditioning entry points, and a simple diagnostic
+shows each carries a distinct concept type: zeroing the CLIP-pooled
+embedding on a fixed prompt collapses the generation to noise, while
+zeroing the T5 path leaves the object intact and merely shifts style.
+We design the unlearning procedure around this observation. Two
+protocols are sufficient: \emph{Style-Vacuum} subtracts a single
+T5 direction and \emph{Object-Vacuum} subtracts an uncapped CLIP
+direction together with a per-step T5 direction. Per-concept $\beta$
+selection on a small proxy set then handles the substantial
+concept-to-concept variance that a single global $\beta$ leaves
+unchecked. The same recipe does not transfer to SD3.5; we report this
+as a limitation, with a diagnostic-grounded explanation in
+\S\ref{sec:discuss}.
 
 \paragraph{Contributions.}
-(i)~A two-protocol activation-steering framework for FLUX
-(\textbf{Style-Vacuum}, \textbf{Object-Vacuum}) that intervenes only
-at text-conditioning entry points and requires no model retraining.
-(ii)~A subspace zeroing diagnostic that grounds the protocol design in
-where the concept actually lives, applied to both FLUX and SD3.5.
-(iii)~Per-concept $\beta$ selection via a 12-image proxy and a
-symmetric UA/IRA/CRA composite, addressing the high concept-to-concept
-variance of a single global $\beta$.
-(iv)~Full UnlearnCanvas results on FLUX-schnell ($20$ objects,
-$10$ styles), matching TRACE on style UA and exceeding it on object UA.
+(i)~Two diagnostic-grounded activation-steering protocols for FLUX
+DiTs---\textbf{Style-Vacuum} and \textbf{Object-Vacuum}---intervening
+only at text-conditioning entry points and requiring no model
+retraining.
+(ii)~A subspace zeroing diagnostic that grounds the protocol design
+in where each concept type actually lives.
+(iii)~A per-concept $\beta$ search via a 12-image proxy and a
+symmetric UA/IRA/CRA composite, addressing the high variance of a
+single global $\beta$ across $20$ objects and $10$ styles.
+(iv)~Full UnlearnCanvas results on FLUX-schnell that match TRACE's
+published FLUX style UA and exceed its object UA.
 
 \section{Background and Related Work}
 \label{sec:bg}
@@ -116,65 +118,73 @@ $10$ styles), matching TRACE on style UA and exceeding it on object UA.
 \paragraph{DiT architectures.}
 FLUX and SD3.5 use \emph{Multi-Modal Diffusion Transformer} blocks in
 which text and image tokens are concatenated and processed by joint
-attention~\cite{esser2024scaling}. Both models route text through two
-parallel paths: a \emph{pooled} embedding that drives AdaLN modulation
-across all blocks, and a \emph{sequence} embedding that participates
-in joint attention with image tokens. FLUX uses a 768-d CLIP-L pooled
-vector and a T5 sequence; the first 19 blocks are double-stream and
-the next 38 are single-stream. SD3.5 concatenates two CLIP encoders
-into a 2048-d pooled vector and projects CLIP-L+G and T5 into a
-333-token sequence ($77$ CLIP $+\,256$ T5) processed by 24 joint
-blocks. SD3.5 runs with classifier-free guidance (CFG) at scale
-${\sim}4$; FLUX-schnell is distilled and runs at guidance scale~$0$.
+attention~\cite{esser2024scaling}. Both route text through two
+parallel paths: a \emph{pooled} embedding that drives AdaLN
+modulation across all blocks, and a \emph{sequence} embedding that
+participates in joint attention with image tokens. FLUX uses a
+$768$-d CLIP-L pooled vector and a T5 sequence, with $19$
+double-stream and $38$ single-stream blocks; FLUX-schnell is a
+$4$-step distillation that runs at guidance scale~$0$. SD3.5
+concatenates two CLIP encoders into a $2048$-d pooled vector and
+projects CLIP-L+G and T5 into a $333$-token sequence
+($77$ CLIP $+\,256$ T5) processed by $24$ joint blocks under
+classifier-free guidance.
 
 \paragraph{Activation steering.}
 In LLMs, activation steering adds a linear direction to hidden states
-to control behavior~\cite{turner2024steering,panickssery2024steering}.
-The direction is typically the mean difference of activations between
-contrastive prompts. CASteer~\cite{khrulkov2024casteer} extends this
-to cross-attention U-Nets using $50$ ImageNet base contexts to
-diversify prompt pairs and a clip-negative ReLU rule for
-clamping---both ingredients we adopt.
+to control behavior~\cite{turner2024steering,panickssery2024steering};
+the direction is the mean difference of activations between
+contrastive prompts. CASteer~\cite{khrulkov2024casteer} extends the
+idea to cross-attention U-Nets, introducing two ingredients we
+adopt: $50$ ImageNet base contexts to diversify prompt pairs, and a
+clip-negative ReLU rule that fires only when the activation is
+positively aligned with the concept direction.
 
 \paragraph{Concept unlearning.}
-Most methods edit weights: ESD~\cite{gandikota2023erasing} fine-tunes
-with negative prompts, UCE~\cite{gandikota2024unified} performs
-closed-form weight edits, and TRACE~\cite{tracepaper} replaces the
-projection layer and modulation MLP with trained transcoders, reporting
-the strongest UA on FLUX and SD3.5. TRACE's App.~D.1 explicitly notes
-that ``despite operating on a pooled representation,'' intervening at
-the modulation MLP is necessary for effective suppression in SD3.5
-and FLUX. UnlearnCanvas~\cite{zhang2024unlearncanvas} provides the
+Most prior methods edit weights. ESD~\cite{gandikota2023erasing}
+fine-tunes with negative prompts, UCE~\cite{gandikota2024unified}
+performs closed-form weight edits, and TRACE~\cite{tracepaper}
+replaces the projection layer and the modulation MLP with trained
+transcoders, reporting the strongest UA on FLUX and SD3.5. TRACE's
+App.~D.1 explicitly notes that, in SD3.5 and FLUX, ``despite operating
+on a pooled representation,'' intervening at the modulation MLP is
+necessary in addition to the projection layer for effective concept
+suppression---a finding that motivates one of our diagnostics on
+SD3.5. UnlearnCanvas~\cite{zhang2024unlearncanvas} provides the
 $10$-style $\times\,20$-object grid we evaluate on, with three
-metrics: \emph{Unlearning Accuracy} (UA), \emph{In-domain Retain
-Accuracy} (IRA), and \emph{Cross-domain Retain Accuracy} (CRA).
+metrics: \emph{Unlearning Accuracy} (UA, fraction of target-bearing
+images not classified as the target), \emph{In-domain Retain
+Accuracy} (IRA, accuracy on the target axis for non-target prompts),
+and \emph{Cross-domain Retain Accuracy} (CRA, accuracy on the
+orthogonal axis).
 
 \section{Method}
 \label{sec:method}
 
-We treat unlearning as the problem of identifying and neutralizing the
-text-conditioning \emph{entry points} through which a concept reaches
-the joint-attention stack. We register hooks at these entry points,
-estimate a per-concept direction in their activation space using
-contrastive prompts, and subtract along that direction at inference.
-No weights are updated.
+We treat concept unlearning as the problem of identifying and
+neutralizing the text-conditioning \emph{entry points} through which
+the concept reaches the joint-attention stack. The procedure has
+four ingredients: a zeroing diagnostic that decides where to
+intervene; a contrastive direction estimator at the chosen entry
+points; the inference-time subtraction rule; and a per-concept
+$\beta$ search on a small proxy. No model weights are touched.
 
 \subsection{Subspace diagnostic}
 \label{sec:method_diag}
 
-Before designing any intervention, we run a zeroing panel: on a fixed
-prompt $\langle\text{object},\text{style}\rangle$, we generate the
-baseline once, then once per entry point with that entry point's
-activation zeroed on the conditional batch position. The panel reveals
-what each entry point carries.
+For a fixed prompt $\langle\text{object},\text{style}\rangle$, we
+generate the baseline once, then once per entry point with that
+entry point's activation zeroed on the conditional batch position.
+The panel reveals what each entry point carries.
 
-For FLUX the reading is unambiguous. Zeroing
+For FLUX the result is unambiguous. Zeroing
 \texttt{time\_text\_embed}'s input (the CLIP-pooled embedding)
 collapses the generation to high-frequency noise; zeroing
 \texttt{context\_embedder} (the T5 projection) preserves a
-recognizable object and merely shifts the style. Object identity is
-gated through CLIP\,$\to$\,AdaLN modulation; style flows through
-T5\,$\to$\,joint attention. The two protocols below follow directly.
+recognizable object and merely shifts the style. We read this as:
+object identity is gated through CLIP\,$\to$\,AdaLN modulation; style
+flows through T5\,$\to$\,joint attention. The two protocols below
+follow directly.
 
 \subsection{Direction estimation}
 \label{sec:method_dirs}
@@ -184,7 +194,7 @@ $50$ ImageNet classes as base contexts, following
 CASteer~\cite{khrulkov2024casteer}. For an object target,
 $(p^+_i, p^-_i){=}(\text{``\texttt{class} with \texttt{concept}}'',\,
 \text{``\texttt{class}}'')$; for a style target,
-$(p^+_i, p^-_i){=}(\text{``\texttt{class},\,\texttt{concept} style}'',\,
+$(p^+_i, p^-_i){=}(\text{``\texttt{class}, \texttt{concept} style}'',\,
 \text{``\texttt{class}}'')$. Averaging across diverse contexts cancels
 prompt-specific signal and isolates the concept direction. The
 direction at entry point $S$ is the L2-normalized mean of
@@ -193,25 +203,28 @@ $h_S(p^+_i)\!-\!h_S(p^-_i)$ across pairs.
 \subsection{Two protocols}
 \label{sec:method_protocols}
 
-\paragraph{Style-Vacuum.} A single 4096-d T5 direction is taken on the
-\emph{input} of \texttt{context\_embedder} (raw T5 embeddings,
-mask-aware mean-pooled across non-padding tokens), and a 768-d CLIP
-direction on the input of \texttt{time\_text\_embed}. Two vectors per
-concept; no per-step factorization. Defaults set
-$\beta_{\mathrm{CLIP}}{=}0$ and $\beta_{\mathrm{T5}}\!\in\![1,6]$
-because the diagnostic places style in T5.
+\paragraph{Style-Vacuum.} A single $4096$-d T5 direction is taken on
+the \emph{input} of \texttt{context\_embedder} (raw T5 embeddings,
+mask-aware mean-pooled across non-padding tokens). A $768$-d CLIP
+direction on \texttt{time\_text\_embed} is also exposed, but the
+diagnostic places style in T5 alone, so the default sets
+$\beta_{\mathrm{CLIP}}{=}0$ and uses
+$\beta_{\mathrm{T5}}\!\in\![1,6]$. Two vectors per concept; no
+per-step factorization.
 
 \paragraph{Object-Vacuum.} The CLIP direction is estimated as above.
 For T5 we register a forward hook on the \emph{output} of
 \texttt{context\_embedder} and accumulate per-step, mask-aware
 mean-pooled differences over the denoising trajectory, yielding one
-3072-d direction per step. Per-step is necessary because object
-identity is committed within FLUX-schnell's $4$ steps, and a
-time-averaged direction under-removes it. CLIP is intentionally
-\emph{uncapped} ($\kappa{=}\infty$ below) so that
-$\beta_{\mathrm{CLIP}}\!>\!1$ pushes the projection past zero into
-anti-concept space; capping at $1$ merely slides the model to a
-neighbouring class.
+$3072$-d direction per step. A per-step direction is necessary
+because object identity is committed within FLUX-schnell's $4$
+denoising steps; a single time-averaged direction under-removes it.
+CLIP is intentionally \emph{uncapped}---the cap parameter $\kappa$ in
+Eq.~\ref{eq:steer} is $\infty$---so $\beta_{\mathrm{CLIP}}\!>\!1$ can
+push the projection past zero into anti-concept space. Capping at
+$\kappa{=}1$ subtracts only one axis of pooled CLIP, and because
+object identity occupies a multi-dimensional CLIP subspace the model
+merely rolls to a neighbouring class.
 
 \subsection{Inference-time injection}
 \label{sec:method_inject}
@@ -222,84 +235,93 @@ $\beta_S\!\geq\!0$, we apply CASteer's clip-negative rule:
 \label{eq:steer}
 h'_S \;=\; h_S \,-\, \min(\beta_S, \kappa)\cdot\mathrm{ReLU}\!\bigl(\langle h_S, \hat v_S\rangle\bigr) \cdot \hat v_S.
 \end{equation}
-The ReLU clamp ensures we only fire on positively aligned activations.
-The cap $\kappa$ is per-protocol: $\kappa{=}1$ for Style-Vacuum (CLIP
-is dormant anyway) and $\kappa{=}\infty$ for Object-Vacuum (uncapped).
-For sequence-valued entry points (T5), the projection is per-token
-and an optional top-fraction gate localizes subtraction to
-concept-aligned tokens. Steering applies \emph{only} to the
-conditional batch position; the unconditional CFG reference frame is
-left untouched. FLUX-schnell runs at guidance scale $0$, so the
-conditional position is the entire forward.
+The $\mathrm{ReLU}$ clamp ensures we only fire on positively aligned
+activations, avoiding sign-flip amplification on unrelated prompts.
+The cap $\kappa$ is per-protocol: $\kappa{=}1$ for Style-Vacuum
+($\beta_{\mathrm{CLIP}}{=}0$ keeps the CLIP path inert anyway) and
+$\kappa{=}\infty$ for Object-Vacuum. For sequence-valued entry points
+(T5), the projection is computed per token; an optional top-fraction
+gate localizes the subtraction to concept-aligned tokens. Steering
+applies \emph{only} to the conditional batch position; the
+unconditional CFG reference frame is left untouched. FLUX-schnell
+runs at guidance scale~$0$, so the conditional position is the entire
+forward.
 
-\subsection{Per-concept hyperparameter selection}
+\subsection{Per-concept $\beta$ selection}
 \label{sec:method_hp}
 
-A single global $\beta$ is empirically suboptimal: at
+A single global $\beta$ is empirically suboptimal. At
 $(\beta_{\mathrm{CLIP}},\beta_{\mathrm{T5}}){=}(3,5)$ on FLUX,
 distinctive silhouettes (Architectures, Bears) over-steer to
 UA${=}100\%$ but CRA${\sim}30\%$, while broad concepts (Butterfly,
-Flame) under-steer to UA${<}5\%$. We therefore run a per-concept grid
-search on a $12$-image proxy ($3$ proxy styles
+Flame) under-steer to UA${<}5\%$. We therefore run a per-concept
+grid search on a $12$-image proxy ($3$ proxy styles
 $\times\,2$ proxy objects $\times\,2$ seeds, with the target on the
-relevant axis), classified with LLaVA, scored by
+relevant axis), classify proxy outputs with LLaVA, and score by
 \[
-\mathrm{score}(\beta) = 0.5\cdot\mathrm{UA} + 0.25\cdot\mathrm{IRA} + 0.25\cdot\mathrm{CRA}.
+\mathrm{score}(\beta) \;=\; 0.5\cdot\mathrm{UA} + 0.25\cdot\mathrm{IRA} + 0.25\cdot\mathrm{CRA}.
 \]
-The object grid sweeps $(\beta_{\mathrm{CLIP}},\beta_{\mathrm{T5}})\!\in\!
+The weighting is symmetric: UA dominant because it is the headline
+metric, IRA and CRA equal because UnlearnCanvas explicitly shows the
+two retention metrics dissociate. The object grid sweeps
+$(\beta_{\mathrm{CLIP}},\beta_{\mathrm{T5}})\!\in\!
 \{(1{,}3),(3{,}5),(5{,}8),(8{,}12),(10{,}15)\}$; the style grid
 sweeps $\beta_{\mathrm{T5}}\!\in\!\{1,2,4,6\}$ at
-$\beta_{\mathrm{CLIP}}{=}0$. Selected $\beta$'s are cached and reused
-for the full benchmark.
+$\beta_{\mathrm{CLIP}}{=}0$. Selected $\beta$'s are cached and
+reused for the full benchmark.
 
-\subsection{Evaluation protocol}
-\label{sec:method_eval}
-
-We use the UnlearnCanvas $10\!\times\!20$ grid restricted to the
-TRACE-paper concept set, with the prompt template ``A
-\texttt{\{object\}} image in \texttt{\{style\}} style.''. Generations
-are classified by LLaVA-1.6-Vicuna-7B using the numbered-list format
-introduced by TRACE (App.~E.4); the original UnlearnCanvas SD-1.5
-classifier generalizes below $6\%$ to FLUX/SD3.5. We use the five
-TRACE seeds $\{188, 288, 588, 688, 888\}$, generating $1000$ images
-per target concept, and additionally report FID against a shared
-$1000$-image unsteered baseline grid and the CLIP-ViT-L/14 score on
-the generation prompt.
-
-\section{Experiments and Results}
+\section{Experiments}
 \label{sec:exp}
 
-\paragraph{Setup.}
-Experiments are on FLUX.1-schnell (4 steps, guidance~$0$).
-Per-concept directions are learned in ${\sim}100$ forward passes
-($N{=}50$ pairs $\times\,2$) and cached. Style-Vacuum is used for
-style targets, Object-Vacuum for object targets, each with the
-per-concept $\beta$ from \S\ref{sec:method_hp}. The headline numbers
-below are computed on $1000$ images per concept. SD3.5-medium
-(28 steps, guidance~$4.0$) is reported only as a diagnostic in
-\S\ref{sec:exp_sd35}.
+\subsection{Setup}
+\label{sec:exp_setup}
 
-\subsection{Object unlearning on FLUX-schnell}
+\paragraph{Model.} All reported numbers are on FLUX.1-schnell
+($4$ inference steps, guidance scale~$0$, license-permissive). Vector
+estimation runs once per concept in ${\sim}100$ forward passes
+($N{=}50$ pairs $\times\,2$ prompts) and the result is cached.
+
+\paragraph{Benchmark and prompt.} We use the UnlearnCanvas
+$10\!\times\!20$ grid restricted to the TRACE concept set, with the
+prompt template ``A \texttt{\{object\}} image in
+\texttt{\{style\}} style.''.
+
+\paragraph{Classifier.} Generations are classified by
+LLaVA-1.6-Vicuna-7B using the numbered-list prompt format introduced
+by TRACE (App.~E.4); the original UnlearnCanvas SD-1.5 classifier
+generalizes below $6\%$ to FLUX outputs and is unsuitable.
+
+\paragraph{Seeds and grid size.} We evaluate on the five TRACE
+reproducibility seeds $\{188, 288, 588, 688, 888\}$, generating
+$10\!\times\!20\!\times\!5{=}1000$ images per target concept. We
+additionally report FID against a shared $1000$-image unsteered
+baseline grid (generated once and reused across concepts) and the
+CLIP-ViT-L/14 score on the generation prompt.
+
+\subsection{Object unlearning}
 \label{sec:exp_obj}
 
 Object-Vacuum yields an average UA of $\mathbf{97.3\%}$ across the
-$20$ object concepts, with average IRA${=}88.45\%$ (other-object
-preservation) and average CRA${=}33.82\%$ (style preservation on
-non-target images); see Table~\ref{tab:obj}. Fifteen of twenty
-concepts reach UA${=}100\%$; the lowest UA values are on Human
-($86\%$) and Sea ($86\%$), where LLaVA confounds with adjacent
-categories. Average FID against the unsteered baseline is $45.95$ and
-average CLIP score is $0.260$. Our object UA exceeds TRACE's
-published FLUX object UA ($93.2\%$); CRA is lower
-(\S\ref{sec:exp_compare}), which we discuss as an explicit trade-off.
+$20$ object concepts (Table~\ref{tab:obj}), with average
+IRA${=}88.45\%$ (other-object preservation) and average
+CRA${=}33.82\%$ (style preservation on non-target images). Fifteen of
+twenty concepts reach UA${=}100\%$; the lowest UA values are on
+Human ($86\%$) and Sea ($86\%$), categories where LLaVA confounds
+with adjacent classes. Per-concept FID ranges from $31.6$ to $64.4$
+and tracks the prompt-level disruption introduced by removing
+scene-anchored objects (Sea and Sandwiches: low FID; Frogs and
+Waterfalls: high FID). The headline UA exceeds TRACE's published
+FLUX object UA ($93.2\%$); CRA is markedly lower
+(\S\ref{sec:exp_compare}), an explicit trade-off we discuss in
+\S\ref{sec:discuss}.
 
 \begin{table}[t]
-\caption{FLUX-schnell, object unlearning (Object-Vacuum). UA, IRA,
-CRA in $\%$; FID lower is better; CLIP higher is better.}
+\caption{FLUX-schnell, object unlearning (Object-Vacuum), full
+UnlearnCanvas grid. UA, IRA, CRA in $\%$; FID lower is better; CLIP
+higher is better.}
 \label{tab:obj}
 \centering
-\footnotesize
-\setlength{\tabcolsep}{4pt}
+\small
 \begin{tabular}{lrrrrr}
 \toprule
 Concept & UA & IRA & CRA & FID & CLIP \\
@@ -325,32 +347,31 @@ Towers        & 100  & 87.68 & 32.21 & 48.15 & 0.260 \\
 Trees         & 100  & 89.58 & 34.21 & 44.77 & 0.263 \\
 Waterfalls    & 100  & 85.79 & 27.26 & 56.89 & 0.253 \\
 \midrule
-\textbf{Avg.} & \textbf{97.30} & \textbf{88.45} & \textbf{33.82} & \textbf{45.95} & \textbf{0.260} \\
+\textbf{Average} & \textbf{97.30} & \textbf{88.45} & \textbf{33.82} & \textbf{45.95} & \textbf{0.260} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsection{Style unlearning on FLUX-schnell}
+\subsection{Style unlearning}
 \label{sec:exp_style}
 
 Style-Vacuum yields average UA${=}\mathbf{88.9\%}$ across the ten
 TRACE-aligned styles (Table~\ref{tab:style}), statistically on par
 with TRACE's published FLUX style UA of $88.6\%$, while leaving CRA
-high ($86.6\%$). IRA at $35.72\%$ is at the same structural ceiling
-TRACE reports ($36.1\%$): when one style is removed and the LLaVA
-classifier is forced to choose another from a 10-way list, accuracy
-on the remaining nine is bounded by the classifier's own style
-discrimination on neutralized images. Cubism, Winter, Pop\_Art, and
-Ukiyoe each reach UA${=}100\%$; Impressionism is the weakest
-(UA${=}66\%$), consistent with its visual proximity to a generic
-realistic palette.
+high ($86.6\%$). IRA at $35.72\%$ sits at the same structural ceiling
+TRACE reports ($36.1\%$): when one style is removed and LLaVA is
+forced to choose another from a $10$-way list, accuracy on the
+remaining nine is bounded by the classifier's discrimination on
+neutralized images. Cubism, Winter, Pop\_Art, and Ukiyoe each reach
+UA${=}100\%$; Impressionism is the weakest (UA${=}66\%$), consistent
+with its visual proximity to a generic realistic palette.
 
 \begin{table}[t]
-\caption{FLUX-schnell, style unlearning (Style-Vacuum).}
+\caption{FLUX-schnell, style unlearning (Style-Vacuum), full
+UnlearnCanvas grid.}
 \label{tab:style}
 \centering
-\footnotesize
-\setlength{\tabcolsep}{4pt}
+\small
 \begin{tabular}{lrrrrr}
 \toprule
 Concept & UA & IRA & CRA & FID & CLIP \\
@@ -366,7 +387,7 @@ Impressionism   & 66  & 35.67 & 87.11 & 39.10 & 0.262 \\
 Byzantine       & 81  & 39.78 & 89.67 & 29.69 & 0.271 \\
 Bricks          & 72  & 41.44 & 89.44 & 34.54 & 0.272 \\
 \midrule
-\textbf{Avg.} & \textbf{88.90} & \textbf{35.72} & \textbf{86.60} & \textbf{53.81} & \textbf{0.246} \\
+\textbf{Average} & \textbf{88.90} & \textbf{35.72} & \textbf{86.60} & \textbf{53.81} & \textbf{0.246} \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -374,21 +395,21 @@ Bricks          & 72  & 41.44 & 89.44 & 34.54 & 0.272 \\
 \subsection{Comparison with TRACE on FLUX}
 \label{sec:exp_compare}
 
-Table~\ref{tab:compare} compares against the FLUX rows of TRACE's
-Table~$1$~\cite{tracepaper}. On UA we match TRACE on style and exceed
-it on objects, with no weight updates. The remaining gap is on CRA:
-weight-editing methods preserve more of the orthogonal axis. We do
-not claim a Pareto improvement; the headline finding is that an
-inference-time entry-point intervention reaches transcoder-level UA
-on FLUX without any model fitting.
+Table~\ref{tab:compare} reproduces the FLUX rows of TRACE's
+Table~$1$~\cite{tracepaper} alongside our two protocols. On UA we
+match TRACE on style and exceed it on objects, with no weight
+updates. The remaining gap is on retention---particularly object
+CRA, where weight-editing methods preserve more of the orthogonal
+axis. We do not claim a Pareto improvement; the headline finding is
+that an inference-time entry-point intervention reaches
+transcoder-level UA on FLUX without any model fitting.
 
 \begin{table}[t]
 \caption{FLUX comparison against TRACE Table~$1$. Higher is better
-for UA/IRA/CRA, lower for FID. ``--'' = not reported.}
+for UA/IRA/CRA, lower for FID. ``--'' = not reported by TRACE.}
 \label{tab:compare}
 \centering
-\footnotesize
-\setlength{\tabcolsep}{4pt}
+\small
 \begin{tabular}{llrrrr}
 \toprule
 Task & Method & UA & IRA & CRA & FID \\
@@ -406,78 +427,82 @@ Task & Method & UA & IRA & CRA & FID \\
 \end{tabular}
 \end{table}
 
-\subsection{SD3.5: diagnostic, no clean removal}
-\label{sec:exp_sd35}
-
-The same recipe does not transfer. On the prompt ``a Dog in Van Gogh
-style'', no single entry-point zeroing destroys the dog: zeroing the
-full $2048$-d pooled vector changes $96\%$ of pixels but leaves a
-recognizable animal; CLIP-L alone changes $36\%$, CLIP-G alone $77\%$,
-and both leave object identity intact. Object identity is therefore
-\emph{redundantly} encoded across the two CLIP encoders and the T5
-path. Style is more localized: zeroing the CLIP region of
-\texttt{context\_embedder} output destroys Van Gogh, while zeroing the
-T5 region leaves it. Joint multi-subspace steering at moderate
-strengths fails to remove objects; at high strengths the image
-collapses but residual object features survive. Following TRACE
-App.~D.1, we additionally hook \texttt{tte\_out}, the post-SiLU output
-of \texttt{time\_text\_embed} (i.e., the AdaLN modulation signal); the
-hook is implemented and the diagnostic confirms it acts on the right
-surface, but achieving FLUX-comparable UnlearnCanvas numbers on SD3.5
-was not feasible within the project window. We treat SD3.5 as a
-limitation (\S\ref{sec:discuss}).
-
-\subsection{Ablations on FLUX}
+\subsection{Ablations}
 \label{sec:exp_abl}
 
-\paragraph{Number of contrastive pairs.} Direction quality is visibly
-noisier at $N{=}10$ and stabilizes by $N{=}50$, consistent with
-CASteer's reported saturation~\cite{khrulkov2024casteer}.
+\paragraph{Number of contrastive pairs.} Direction quality is
+visibly noisier at $N{=}10$ and stabilizes by $N{=}50$, consistent
+with CASteer's reported saturation~\cite{khrulkov2024casteer}.
 
-\paragraph{CLIP cap.} Capping $\beta_{\mathrm{CLIP}}$ at $1$ silently
-throttles object steering: subtracting $1\!\times\!\hat v_{\mathrm{CLIP}}$
-zeroes one axis of pooled CLIP, but object identity occupies a
-multi-dimensional subspace, so the model rolls to a neighbouring
-class. Removing the cap and using $\beta_{\mathrm{CLIP}}{=}3$ pushes
-the projection through zero and is what produces clean object removal.
+\paragraph{CLIP cap.} Capping $\beta_{\mathrm{CLIP}}$ at
+$\kappa{=}1$ silently throttles object steering: subtracting
+$1\!\times\!\hat v_{\mathrm{CLIP}}$ zeroes one axis of pooled CLIP,
+but object identity occupies a multi-dimensional subspace, so the
+model rolls to a neighbouring class. Removing the cap and using
+$\beta_{\mathrm{CLIP}}{=}3$ pushes the projection through zero and is
+what produces clean object removal.
 
 \paragraph{Composite objective.} Replacing the symmetric
-$0.5{:}0.25{:}0.25$ composite with UA-only over-selects retention-killing
-configurations; UA${+}$IRA under-selects on objects where CRA is the
-more pressing failure mode. The symmetric composite is the operating
-choice.
+$0.5{:}0.25{:}0.25$ composite with UA-only over-selects
+retention-killing configurations on objects with distinctive
+silhouettes; UA${+}$IRA under-selects on concepts where CRA is the
+more pressing failure mode. The symmetric composite produces
+selections closest to the visual sweet spot in our review.
 
-\section{Discussion}
+\paragraph{Boundary diagnostics.} On roughly $15\%$ of FLUX object
+concepts (Flame, Butterfly, Flowers), the per-concept search lands
+on the boundary of the $5$-cell grid, indicating the true optimum
+lies outside the searched range. We log these as ``boundary-warning''
+picks; extending the grid resolves them at the cost of additional
+search compute.
+
+\section{Discussion and Limitations}
 \label{sec:discuss}
 
-The FLUX results carry a mechanistic reading: the diagnostic isolates
-two text pathways with disjoint roles---CLIP\,$\to$\,AdaLN for object
-identity, T5\,$\to$\,joint attention for style---and the two-protocol
-design follows directly. FLUX's distilled inference (no CFG
+The FLUX results carry a mechanistic reading rather than a purely
+engineering one. The diagnostic isolates two text pathways with
+disjoint roles---CLIP\,$\to$\,AdaLN for object identity,
+T5\,$\to$\,joint attention for style---and the two-protocol design
+follows directly. FLUX-schnell's distilled inference (no CFG
 amplification) and double-stream attention let entry-point
-subtractions propagate through AdaLN with minimal scrambling, which is
-why training-free steering is competitive with transcoder-based
-weight editing on UA.
+subtractions propagate through AdaLN with minimal scrambling, which
+is why training-free entry-point steering is competitive with
+transcoder-based weight editing on UA.
 
-\paragraph{Limitations.} SD3.5 is the headline open problem: the
-diagnostic shows redundancy of object identity across the two CLIP
-encoders and the T5 path, and the joint-attention stack reconstructs
-features from signal that survives input-side subtraction. The
-\texttt{tte\_out} hook is implemented but a FLUX-level sweep on SD3.5
-is left for future work. We evaluate on FLUX-schnell (4 steps,
-guidance~$0$); the absence of CFG and lower step count simplify
-entry-point steering and confound absolute comparisons to TRACE's
-FLUX row, which was likely produced on the dev variant. Object CRA
-is meaningfully lower than transcoder-based methods because pushing
-the CLIP-pooled projection past zero scrambles the AdaLN-modulated
-style signal that shares the path. The contrastive direction is
-rank-$1$ by construction; rank-$k$ subspace
-removal~\cite{khrulkov2024casteer} is an obvious extension.
+\paragraph{SD3.5.} The same recipe does not transfer to
+SD3.5-medium, and we do not report numerical results on it. Our
+diagnostic shows two structural reasons. First, SD3.5
+\emph{redundantly} encodes object identity across encoders: on the
+prompt ``a Dog in Van Gogh style'', zeroing the full $2048$-d pooled
+vector changes $96\%$ of pixels but leaves a recognizable animal;
+the CLIP-L slice alone changes $36\%$, the CLIP-G slice $77\%$, and
+in both cases object identity persists. There is no single
+entry-point analog of FLUX's CLIP-pooled lever. Second, the
+joint-attention stack appears to reconstruct concept features from
+signal that survives input-side subtraction: at low and moderate
+strengths, joint multi-subspace steering across the four input-side
+subspaces (\texttt{pooled\_clipL}, \texttt{pooled\_clipG},
+\texttt{ctx\_clip}, \texttt{ctx\_t5}) leaves the dog visible; at high
+strengths the image structure collapses but residual object features
+remain embedded in the new structure. Following TRACE App.~D.1, we
+additionally implemented a hook on \texttt{tte\_out}---the post-SiLU
+output of \texttt{time\_text\_embed}, i.e., the AdaLN modulation
+signal that feeds every block---and the diagnostic confirms it acts
+on the right surface, but tuning a competitive recipe was not
+feasible within the project window. Closing this gap is the natural
+next step.
 
-\paragraph{Outlook.} The natural next step is closing the SD3.5 gap:
-tuning the \texttt{tte\_out} recipe and adding the DiT analog of
-CASteer's per-block hooks ($\mathrm{add\_k\_proj}$,
-$\mathrm{add\_q\_proj}$) to address the diagnosed redundancy.
+\paragraph{Other limitations.} We evaluate on FLUX-schnell ($4$
+steps, guidance~$0$); the absence of CFG and the lower step count
+simplify entry-point steering relative to FLUX-dev ($28$ steps), and
+absolute UA comparisons against TRACE's published FLUX row should be
+read with this caveat. Object CRA is meaningfully lower than
+transcoder-based methods because pushing the CLIP-pooled projection
+past zero scrambles the AdaLN-modulated style signal that shares the
+path. Finally, the contrastive-pair direction is rank-$1$ by
+construction; distributed concepts may benefit from rank-$k$
+subspace removal as in CASteer~\cite{khrulkov2024casteer}, which we
+did not evaluate.
 
 \section*{Software and Data}
 
@@ -492,14 +517,13 @@ acceptance.
 \section{Implementation details}
 \label{app:impl}
 
-We use \texttt{FLUX.1-schnell} (4 inference steps, guidance scale~$0$)
-and \texttt{stable-diffusion-3.5-medium} (28 inference steps, guidance
-scale~$4.0$). All steering hooks operate exclusively on the
+We use \texttt{FLUX.1-schnell} ($4$ inference steps, guidance
+scale~$0$). All steering hooks operate exclusively on the
 conditional batch position. LLaVA classifies into the $10$ TRACE
-styles and $20$ TRACE object classes with the numbered-list prompt
-format. FID is computed against a shared $1000$-image unsteered
-baseline grid produced once and reused across all concepts. The full
-reproducibility configuration, including the per-concept $\beta$ JSON
-cache, is in the code repository.
+styles and the $20$ TRACE object classes with the numbered-list
+prompt format. FID is computed against a shared $1000$-image
+unsteered baseline grid produced once and reused across all
+concepts. The full reproducibility configuration, including the
+per-concept $\beta$ JSON cache, is in the code repository.
 
 \end{document}
