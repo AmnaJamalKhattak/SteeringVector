@@ -12,9 +12,7 @@ from diffusers import StableDiffusion3Pipeline
 from huggingface_hub import login
 from google.colab import userdata
 
-from google.colab import userdata
-hf_token = userdata.get("HF_TOKEN")
-login(token=hf_token)
+
 
 DEVICE = "cuda"
 DTYPE = torch.bfloat16  # SD3.5 recommends bfloat16
