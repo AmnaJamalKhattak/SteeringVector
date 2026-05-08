@@ -3242,6 +3242,641 @@ else:
     print(f"\nSaved comparison figure: {vis_path}")
     print(f"Displayed {n} baseline vs steered pairs.")
 
+# ============================================================================
+# CELL 14: MAIN FIGURE — MIXED OBJECT + STYLE UNLEARNING SHOWCASE
+# ============================================================================
+"""
+Builds a TRACE-style "headline" figure: a single panel where each column is
+one unlearned concept, with the Original (no steering) and Ours (steered)
+generations side-by-side. We mix object and style concepts in the same row
+to demonstrate that the same recipe handles both regimes.
+
+Reads pre-generated images from BASELINE_DIR (baselines) and from
+{RESULTS_DIR, STEERED_DIR}/{concept}_{mode} (steered). Concepts that don't
+have both files on disk are skipped silently so this cell works
+incrementally as more experiments complete.
+
+Output: figs/main_showcase.png  (also displayed inline)
+"""
+
+import matplotlib.patches as mpatches
+import matplotlib.gridspec as gridspec
+
+FIGS_DIR = os.path.join(ROOT_DIR, "figs")
+os.makedirs(FIGS_DIR, exist_ok=True)
+
+
+def _candidate_steered_dirs(concept):
+    """All directories that may contain steered images for a concept."""
+    cands = []
+    for base in (RESULTS_DIR, STEERED_DIR):
+        if not os.path.isdir(base):
+            continue
+        # Exact match patterns: {concept}_{mode}
+        for entry in os.listdir(base):
+            full = os.path.join(base, entry)
+            if not os.path.isdir(full):
+                continue
+            if entry == concept or entry.startswith(f"{concept}_"):
+                cands.append(full)
+    return cands
+
+
+def _find_pair(concept, target_type, preferred_partner=None, preferred_seed=None):
+    """
+    Find a (baseline, steered, prompt) triple for a given concept.
+
+    Strategy:
+      - For style:  filename pattern is {concept}_{object}_seed{seed}.jpg
+      - For object: filename pattern is {style}_{concept}_seed{seed}.jpg
+    Tries the preferred partner/seed first, then falls back to any pair that
+    exists on disk.
+    """
+    baseline_dir = os.path.join(BASELINE_DIR, concept)
+    steered_dirs = _candidate_steered_dirs(concept)
+
+    if not os.path.isdir(baseline_dir) or not steered_dirs:
+        return None
+
+    # Build candidate filenames in priority order
+    seeds = [preferred_seed] if preferred_seed is not None else []
+    seeds += [s for s in EVAL_SEEDS if s not in seeds]
+
+    if target_type == "style":
+        partners = [preferred_partner] if preferred_partner else []
+        partners += [o for o in OBJECTS if o not in partners]
+        candidates = [
+            (f"{concept}_{o}_seed{s}.jpg",
+             f"A {o.replace('_', ' ')} image in {concept.replace('_', ' ')} style.")
+            for s in seeds for o in partners
+        ]
+    else:
+        partners = [preferred_partner] if preferred_partner else []
+        partners += [s for s in STYLES if s not in partners]
+        candidates = [
+            (f"{st}_{concept}_seed{s}.jpg",
+             f"A {concept.replace('_', ' ')} image in {st.replace('_', ' ')} style.")
+            for s in seeds for st in partners
+        ]
+
+    for fname, prompt in candidates:
+        b_path = os.path.join(baseline_dir, fname)
+        if not os.path.exists(b_path):
+            continue
+        for sd in steered_dirs:
+            s_path = os.path.join(sd, fname)
+            if os.path.exists(s_path):
+                return b_path, s_path, prompt
+    return None
+
+
+# Curate a mixed showcase: alternate style and object concepts.
+# Edit this list to feature the concepts you want in the headline figure.
+SHOWCASE_CONCEPTS = [
+    ("Van_Gogh",     "style",  "Dogs",       "Van Gogh"),
+    ("Dogs",         "object", "Van_Gogh",   "Dogs"),
+    ("Pop_Art",      "style",  "Human",      "Pop Art"),
+    ("Cats",         "object", "Cartoon",    "Cats"),
+    ("Ukiyoe",       "style",  "Flame",      "Ukiyoe"),
+    ("Butterfly",    "object", "Cubism",     "Butterfly"),
+    ("Impressionism","style",  "Cats",       "Impressionism"),
+    ("Jellyfish",    "object", "Watercolor", "Jellyfish"),
+]
+
+print("="*80)
+print("CELL 14 — MAIN SHOWCASE FIGURE")
+print("="*80)
+
+panels = []
+for concept, ttype, partner, label in SHOWCASE_CONCEPTS:
+    found = _find_pair(concept, ttype, preferred_partner=partner)
+    if found is None:
+        print(f"  Skipping {concept:<14} ({ttype}) — no baseline/steered pair on disk")
+        continue
+    b_path, s_path, prompt = found
+    panels.append((label, ttype, prompt, b_path, s_path))
+    print(f"  Using   {concept:<14} ({ttype}) — {os.path.basename(b_path)}")
+
+if len(panels) == 0:
+    print("\nNo showcase pairs found on disk; run Cell 9 first.")
+else:
+    n_cols = len(panels)
+    fig = plt.figure(figsize=(2.6 * n_cols, 6.4))
+    gs = gridspec.GridSpec(
+        2, n_cols,
+        height_ratios=[1.0, 1.0],
+        hspace=0.32, wspace=0.06,
+    )
+
+    # Header strip with "Original / Ours" labels above each column
+    for col, (label, ttype, prompt, b_path, s_path) in enumerate(panels):
+        for row, (path, sub) in enumerate([(b_path, "Original"), (s_path, "Ours")]):
+            ax = fig.add_subplot(gs[row, col])
+            ax.imshow(Image.open(path).convert("RGB"))
+            ax.set_xticks([]); ax.set_yticks([])
+            for s in ax.spines.values():
+                s.set_visible(False)
+            if row == 0:
+                # Two-line header: concept (bold) + Original/Ours subheader
+                ax.set_title(
+                    f"{label}\n$\\it{{Original}}$",
+                    fontsize=10, pad=4,
+                )
+            else:
+                ax.set_title(r"$\it{Ours}$", fontsize=10, pad=4)
+
+            # Prompt caption only under bottom row, with target word emphasised
+            if row == 1:
+                short_prompt = prompt
+                # Highlight the concept inside the caption
+                key = label.replace("_", " ")
+                cap = short_prompt.replace(key, r"$\bf{" + key.replace(' ', '\\ ') + "}$")
+                ax.set_xlabel(cap, fontsize=8, labelpad=4)
+
+    fig.suptitle(
+        "Our Method Removes Diverse Concepts: Styles, Objects, and Cross-Domain Combinations",
+        fontsize=13, fontweight="bold", y=0.995,
+    )
+    out_path = os.path.join(FIGS_DIR, "main_showcase.png")
+    plt.savefig(out_path, dpi=200, bbox_inches="tight", facecolor="white")
+    plt.show()
+    print(f"\nSaved main showcase figure: {out_path}")
+
+
+# ============================================================================
+# CELL 15: HYPERPARAMETER SWEEP GRIDS (per method)
+# ============================================================================
+"""
+Generates two sweep grids using the currently loaded `steerer` and `vectors`:
+
+  (a) STYLE  recipe (pincer_v2):    sweep BETA_T5 vs CLIP_CAP at fixed BETA_CLIP=0
+                                    -> shows how T5 strength removes style while
+                                       CLIP_CAP guards content fidelity.
+  (b) OBJECT recipe (pincer_perstep): sweep BETA_CLIP vs BETA_T5 (CLIP_CAP=None)
+                                    -> shows the joint pincer effect.
+
+Each grid uses ONE prompt + ONE seed so the only varying factor is the
+hyperparameter. Run AFTER Cell 8 (vector learning) so `vectors` is populated.
+
+Output:
+  figs/sweep_style_{TARGET_CONCEPT}.png     (only if TARGET_TYPE=='style')
+  figs/sweep_object_{TARGET_CONCEPT}.png    (only if TARGET_TYPE=='object')
+"""
+
+print("="*80)
+print("CELL 15 — HYPERPARAMETER SWEEP")
+print("="*80)
+
+
+def _sweep_style(steerer, vectors, target_concept, partner_object="Dogs",
+                 seed=688, betas_t5=(0.0, 1.0, 2.0, 3.0, 4.0),
+                 clip_caps=(0.5, 1.0, 1.5)):
+    prompt = (f"A {partner_object.replace('_', ' ')} image in "
+              f"{target_concept.replace('_', ' ')} style.")
+    n_rows, n_cols = len(clip_caps), len(betas_t5)
+    fig, axes = plt.subplots(
+        n_rows, n_cols, figsize=(2.0 * n_cols, 2.0 * n_rows + 0.6),
+        squeeze=False,
+    )
+    for r, cap in enumerate(clip_caps):
+        for c, bt5 in enumerate(betas_t5):
+            ax = axes[r][c]
+            beta = {"clip": 0.0, "t5": float(bt5)}
+            img = steerer.generate(
+                prompt, seed=seed, vectors=vectors, beta=beta,
+                clip_negative=True, top_frac=1.0,
+                step_range=(0, N_STEPS), clip_cap=float(cap),
+            )
+            ax.imshow(img); ax.set_xticks([]); ax.set_yticks([])
+            if r == 0:
+                ax.set_title(rf"$\beta_{{T5}}={bt5:g}$", fontsize=10)
+            if c == 0:
+                ax.set_ylabel(f"clip_cap={cap:g}", fontsize=10)
+    fig.suptitle(
+        f"Style sweep — pincer_v2, {target_concept.replace('_',' ')}\n"
+        f"(prompt: \"{prompt}\", seed={seed})",
+        fontsize=11, fontweight="bold",
+    )
+    plt.tight_layout()
+    out = os.path.join(FIGS_DIR, f"sweep_style_{target_concept}.png")
+    plt.savefig(out, dpi=180, bbox_inches="tight", facecolor="white")
+    plt.show()
+    print(f"  Saved: {out}")
+
+
+def _sweep_object(steerer, vectors, target_concept, partner_style="Van_Gogh",
+                  seed=688, betas_clip=(0.0, 1.5, 3.0, 4.5),
+                  betas_t5=(0.0, 2.5, 5.0, 7.5)):
+    prompt = (f"A {target_concept.replace('_', ' ')} image in "
+              f"{partner_style.replace('_', ' ')} style.")
+    n_rows, n_cols = len(betas_clip), len(betas_t5)
+    fig, axes = plt.subplots(
+        n_rows, n_cols, figsize=(2.0 * n_cols, 2.0 * n_rows + 0.6),
+        squeeze=False,
+    )
+    for r, bc in enumerate(betas_clip):
+        for c, bt in enumerate(betas_t5):
+            ax = axes[r][c]
+            beta = {"clip": float(bc), "t5": float(bt)}
+            img = steerer.generate(
+                prompt, seed=seed, vectors=vectors, beta=beta,
+                clip_negative=True, top_frac=None,
+                step_range=(0, N_STEPS), clip_cap=None,
+            )
+            ax.imshow(img); ax.set_xticks([]); ax.set_yticks([])
+            if r == 0:
+                ax.set_title(rf"$\beta_{{T5}}={bt:g}$", fontsize=10)
+            if c == 0:
+                ax.set_ylabel(rf"$\beta_{{CLIP}}={bc:g}$", fontsize=10)
+    fig.suptitle(
+        f"Object sweep — pincer_perstep, {target_concept.replace('_',' ')}\n"
+        f"(prompt: \"{prompt}\", seed={seed})",
+        fontsize=11, fontweight="bold",
+    )
+    plt.tight_layout()
+    out = os.path.join(FIGS_DIR, f"sweep_object_{target_concept}.png")
+    plt.savefig(out, dpi=180, bbox_inches="tight", facecolor="white")
+    plt.show()
+    print(f"  Saved: {out}")
+
+
+# Run only the sweep matching the current experiment's TARGET_TYPE so we
+# don't waste GPU time on the wrong recipe. To produce both, change
+# TARGET_TYPE / TARGET_CONCEPT and re-run.
+try:
+    _have_steerer = ("steerer" in globals()) and ("vectors" in globals())
+except NameError:
+    _have_steerer = False
+
+if not _have_steerer:
+    print("  Skipping sweep — `steerer` and `vectors` are not in scope. "
+          "Run Cells 6 and 8 first.")
+elif TARGET_TYPE == "style":
+    _sweep_style(steerer, vectors, TARGET_CONCEPT)
+else:
+    _sweep_object(steerer, vectors, TARGET_CONCEPT)
+
+
+# ============================================================================
+# CELL 16: PER-CONCEPT GRIDS (CASteer-style figures)
+# ============================================================================
+"""
+For every concept that has been steered (i.e., has BOTH baseline images and
+steered images on disk), build a grid figure with a row of paired panels of
+the form  [Original | Ours]  for several partner concepts/seeds. Mirrors
+the layout of CASteer's per-concept figures.
+
+Two figure types are produced:
+  - styles_grid_{STYLE}.png  : rows = (subject1, subject2), cols = Original|Ours
+                               for SUBJECT × STYLE prompts.
+  - objects_grid_{OBJECT}.png: rows = (style1, style2),  cols = Original|Ours
+                               for OBJECT × STYLE prompts.
+
+Reads from disk only — never regenerates — so this is cheap to run.
+"""
+
+print("="*80)
+print("CELL 16 — PER-CONCEPT GRIDS")
+print("="*80)
+
+
+def _list_pairs_for_concept(concept, target_type, max_rows=4):
+    """Return up to `max_rows` (partner, prompt, b_path, s_path) entries."""
+    baseline_dir = os.path.join(BASELINE_DIR, concept)
+    steered_dirs = _candidate_steered_dirs(concept)
+    if not os.path.isdir(baseline_dir) or not steered_dirs:
+        return []
+
+    rows, seen_partners = [], set()
+    if target_type == "style":
+        partners = OBJECTS
+        fname = lambda partner, seed: f"{concept}_{partner}_seed{seed}.jpg"
+        prompt_fn = lambda partner: (
+            f"A {partner.replace('_', ' ')} image in "
+            f"{concept.replace('_', ' ')} style."
+        )
+    else:
+        partners = STYLES
+        fname = lambda partner, seed: f"{partner}_{concept}_seed{seed}.jpg"
+        prompt_fn = lambda partner: (
+            f"A {concept.replace('_', ' ')} image in "
+            f"{partner.replace('_', ' ')} style."
+        )
+
+    for partner in partners:
+        if partner in seen_partners:
+            continue
+        for seed in EVAL_SEEDS:
+            f = fname(partner, seed)
+            b_path = os.path.join(baseline_dir, f)
+            if not os.path.exists(b_path):
+                continue
+            s_path = None
+            for sd in steered_dirs:
+                cand = os.path.join(sd, f)
+                if os.path.exists(cand):
+                    s_path = cand
+                    break
+            if s_path is None:
+                continue
+            rows.append((partner, prompt_fn(partner), b_path, s_path))
+            seen_partners.add(partner)
+            break
+        if len(rows) >= max_rows:
+            break
+    return rows
+
+
+def _draw_concept_grid(concept, target_type, rows, out_path):
+    n_rows = len(rows)
+    fig, axes = plt.subplots(
+        n_rows, 2, figsize=(5.6, 2.8 * n_rows + 0.6),
+        squeeze=False,
+    )
+    for r, (partner, prompt, b_path, s_path) in enumerate(rows):
+        for c, (path, sub) in enumerate([(b_path, "Original"), (s_path, "Ours")]):
+            ax = axes[r][c]
+            ax.imshow(Image.open(path).convert("RGB"))
+            ax.set_xticks([]); ax.set_yticks([])
+            if r == 0:
+                ax.set_title(sub, fontsize=11, fontweight="bold")
+        # Caption row with the partner concept highlighted
+        axes[r][0].set_ylabel(
+            partner.replace("_", " "), fontsize=10, rotation=90,
+            labelpad=8, fontweight="bold",
+        )
+
+    title_word = concept.replace("_", " ")
+    head = ("Style: " if target_type == "style" else "Object: ") + title_word
+    fig.suptitle(head, fontsize=13, fontweight="bold", y=0.995)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=180, bbox_inches="tight", facecolor="white")
+    plt.show()
+    plt.close(fig)
+
+
+# Discover which concepts have both baseline and steered images on disk.
+_steered_concepts = set()
+if os.path.isdir(RESULTS_DIR):
+    for entry in os.listdir(RESULTS_DIR):
+        full = os.path.join(RESULTS_DIR, entry)
+        if not os.path.isdir(full):
+            continue
+        # Strip the "_<mode>" suffix to recover the concept name
+        for mode in ("pincer_v2", "pincer_perstep", "hybrid"):
+            if entry.endswith(f"_{mode}"):
+                _steered_concepts.add(entry[: -len(f"_{mode}")])
+                break
+        else:
+            _steered_concepts.add(entry)
+
+if os.path.isdir(STEERED_DIR):
+    for entry in os.listdir(STEERED_DIR):
+        for mode in ("pincer_v2", "pincer_perstep", "hybrid"):
+            if entry.endswith(f"_{mode}"):
+                _steered_concepts.add(entry[: -len(f"_{mode}")])
+                break
+
+if not _steered_concepts:
+    print("  No steered concept directories found — run Cell 9 first.")
+
+for concept in sorted(_steered_concepts):
+    if concept in STYLES:
+        ttype = "style"
+    elif concept in OBJECTS:
+        ttype = "object"
+    else:
+        continue
+
+    rows = _list_pairs_for_concept(concept, ttype, max_rows=4)
+    if not rows:
+        print(f"  {concept:<16} -- no on-disk pairs found, skipping")
+        continue
+
+    out_name = (
+        f"styles_grid_{concept}.png" if ttype == "style"
+        else f"objects_grid_{concept}.png"
+    )
+    out_path = os.path.join(FIGS_DIR, out_name)
+    _draw_concept_grid(concept, ttype, rows, out_path)
+    print(f"  {concept:<16} -- {len(rows)} rows -> {out_path}")
+
+
+# ============================================================================
+# CELL 17: METHOD PIPELINE DIAGRAM (matplotlib schematic)
+# ============================================================================
+"""
+Renders the method overview figure programmatically — no copy-paste from any
+prior paper. Two stages are drawn:
+
+  (Top)    Vector computation -- a contrastive pair of prompts, the FLUX text
+           encoders (CLIP-L + T5), per-step contrastive deltas, and the
+           resulting steering vector v.
+
+  (Bottom) Application at inference -- at every denoising step t, the
+           pre-projection CLIP and T5 streams are shifted by  -beta * v
+           BEFORE the FLUX transformer block, then denoising proceeds.
+
+The drawing uses only matplotlib primitives so the figure scales cleanly,
+ships with no external assets, and matches the paper's style.
+"""
+
+from matplotlib.patches import FancyBboxPatch, FancyArrowPatch, Rectangle
+
+print("="*80)
+print("CELL 17 — METHOD PIPELINE DIAGRAM")
+print("="*80)
+
+
+def _box(ax, x, y, w, h, text, fc, ec="#222", fontsize=9,
+         fontweight="normal", italic=False):
+    box = FancyBboxPatch(
+        (x, y), w, h,
+        boxstyle="round,pad=0.02,rounding_size=0.06",
+        linewidth=1.2, edgecolor=ec, facecolor=fc,
+    )
+    ax.add_patch(box)
+    style = "italic" if italic else "normal"
+    ax.text(
+        x + w / 2, y + h / 2, text,
+        ha="center", va="center",
+        fontsize=fontsize, fontweight=fontweight, fontstyle=style,
+        wrap=True,
+    )
+
+
+def _arrow(ax, x1, y1, x2, y2, color="#333", lw=1.4, style="-|>"):
+    a = FancyArrowPatch(
+        (x1, y1), (x2, y2),
+        arrowstyle=style, mutation_scale=12,
+        color=color, linewidth=lw,
+    )
+    ax.add_patch(a)
+
+
+fig, ax = plt.subplots(figsize=(13, 7.5))
+ax.set_xlim(0, 13); ax.set_ylim(0, 7.5); ax.axis("off")
+
+# --- Soft section backgrounds --------------------------------------------
+ax.add_patch(Rectangle(
+    (0.15, 4.05), 12.7, 3.3, facecolor="#F2F4F8",
+    edgecolor="#C8CDD6", linewidth=1.0, zorder=0,
+))
+ax.text(0.35, 7.05, "(a) Steering-vector computation (offline)",
+        fontsize=11, fontweight="bold", color="#333")
+
+ax.add_patch(Rectangle(
+    (0.15, 0.20), 12.7, 3.55, facecolor="#FBF6F0",
+    edgecolor="#E0D2BD", linewidth=1.0, zorder=0,
+))
+ax.text(0.35, 3.45, "(b) Inference-time application",
+        fontsize=11, fontweight="bold", color="#333")
+
+# --- Top half: contrastive computation -----------------------------------
+# Prompts
+_box(ax, 0.40, 6.20, 2.30, 0.55,
+     "pos: \"a Dog, Van Gogh style\"",
+     fc="#DCEAF7", fontsize=9)
+_box(ax, 0.40, 5.55, 2.30, 0.55,
+     "neg: \"a Dog\"",
+     fc="#F4D9D9", fontsize=9)
+
+# Text encoders
+_box(ax, 3.30, 6.20, 1.70, 0.55,
+     "CLIP-L\ntext enc.", fc="#FFFFFF", fontsize=9, fontweight="bold")
+_box(ax, 3.30, 5.55, 1.70, 0.55,
+     "T5-XXL\ntext enc.", fc="#FFFFFF", fontsize=9, fontweight="bold")
+
+_arrow(ax, 2.70, 6.475, 3.30, 6.475)
+_arrow(ax, 2.70, 5.825, 3.30, 5.825)
+
+# Per-prompt embeddings (pos / neg, CLIP / T5)
+_box(ax, 5.60, 6.55, 1.55, 0.45, "$e_{pos}^{CLIP}$",
+     fc="#DCEAF7", fontsize=10)
+_box(ax, 5.60, 6.00, 1.55, 0.45, "$e_{neg}^{CLIP}$",
+     fc="#F4D9D9", fontsize=10)
+_box(ax, 5.60, 5.45, 1.55, 0.45, "$e_{pos}^{T5}$",
+     fc="#DCEAF7", fontsize=10)
+_box(ax, 5.60, 4.90, 1.55, 0.45, "$e_{neg}^{T5}$",
+     fc="#F4D9D9", fontsize=10)
+
+_arrow(ax, 5.00, 6.55, 5.60, 6.78)
+_arrow(ax, 5.00, 6.40, 5.60, 6.22)
+_arrow(ax, 5.00, 5.90, 5.60, 5.66)
+_arrow(ax, 5.00, 5.75, 5.60, 5.12)
+
+# Differences
+_box(ax, 7.75, 6.30, 1.65, 0.55,
+     r"$\Delta^{CLIP} = e^{CLIP}_{pos}-e^{CLIP}_{neg}$",
+     fc="#FFFFFF", fontsize=9)
+_box(ax, 7.75, 5.20, 1.65, 0.55,
+     r"$\Delta^{T5} = e^{T5}_{pos}-e^{T5}_{neg}$",
+     fc="#FFFFFF", fontsize=9)
+_arrow(ax, 7.15, 6.55, 7.75, 6.575)
+_arrow(ax, 7.15, 6.00, 7.75, 6.575)
+_arrow(ax, 7.15, 5.45, 7.75, 5.475)
+_arrow(ax, 7.15, 4.90, 7.75, 5.475)
+
+# Aggregate over prompts/seeds + top-k
+_box(ax, 9.95, 5.90, 2.40, 0.55,
+     "average over\n$N$ prompt pairs", fc="#FFFFFF", fontsize=9)
+_box(ax, 9.95, 5.20, 2.40, 0.55,
+     "top-$k$ component\nselection (optional)", fc="#FFFFFF", fontsize=9)
+_arrow(ax, 9.40, 6.575, 9.95, 6.175)
+_arrow(ax, 9.40, 5.475, 9.95, 5.475)
+
+# Final steering vector
+_box(ax, 9.95, 4.30, 2.40, 0.65,
+     r"steering vector $\;v = \{v^{CLIP}, v^{T5}\}$",
+     fc="#E5F2DF", fontsize=10, fontweight="bold")
+_arrow(ax, 11.15, 5.20, 11.15, 4.95)
+
+# --- Bottom half: inference-time application ------------------------------
+# Timeline of denoising steps
+n_steps_drawn = 5
+step_x0, step_x1 = 0.50, 11.30
+step_y = 1.45
+xs = np.linspace(step_x0, step_x1, n_steps_drawn)
+
+ax.text(0.50, 2.95, "Denoising steps",
+        fontsize=10, fontweight="bold")
+
+prev_x = None
+for i, x in enumerate(xs):
+    label = f"$t={n_steps_drawn - i}$" if i < n_steps_drawn - 1 else "$t=0$"
+    _box(ax, x - 0.35, step_y, 0.85, 0.55,
+         label, fc="#FFFFFF", fontsize=9)
+    if prev_x is not None:
+        _arrow(ax, prev_x + 0.50, step_y + 0.275, x - 0.35, step_y + 0.275,
+               color="#666", lw=1.0)
+    prev_x = x
+
+# Highlight a "current step t" with the intervention block above it
+hi_idx = 2
+hx = xs[hi_idx]
+ax.add_patch(Rectangle(
+    (hx - 0.55, step_y - 0.10), 1.30, 0.75,
+    facecolor="none", edgecolor="#C2660E",
+    linewidth=1.6, linestyle="--", zorder=2,
+))
+
+# Intervention sub-diagram above the highlighted step
+ix0, iy0 = hx - 2.10, 2.20
+_box(ax, ix0, iy0 + 0.50, 1.55, 0.55,
+     "CLIP\nstream", fc="#DCEAF7", fontsize=9)
+_box(ax, ix0, iy0 - 0.10, 1.55, 0.55,
+     "T5\nstream", fc="#DCEAF7", fontsize=9)
+
+_box(ax, ix0 + 1.85, iy0 + 0.50, 1.55, 0.55,
+     r"$-\beta_{CLIP}\cdot v^{CLIP}$", fc="#F4D9D9", fontsize=9)
+_box(ax, ix0 + 1.85, iy0 - 0.10, 1.55, 0.55,
+     r"$-\beta_{T5}\cdot v^{T5}$", fc="#F4D9D9", fontsize=9)
+
+_arrow(ax, ix0 + 1.55, iy0 + 0.775, ix0 + 1.85, iy0 + 0.775)
+_arrow(ax, ix0 + 1.55, iy0 + 0.175, ix0 + 1.85, iy0 + 0.175)
+
+_box(ax, ix0 + 3.70, iy0 + 0.20, 1.40, 0.85,
+     "FLUX\ntransformer\nblock", fc="#FFFFFF",
+     fontsize=9, fontweight="bold")
+_arrow(ax, ix0 + 3.40, iy0 + 0.775, ix0 + 3.70, iy0 + 0.625)
+_arrow(ax, ix0 + 3.40, iy0 + 0.175, ix0 + 3.70, iy0 + 0.625)
+
+# Down-arrow into the highlighted step on the timeline
+_arrow(ax, ix0 + 4.40, iy0 + 0.20, hx + 0.075, step_y + 0.55,
+       color="#C2660E", lw=1.6)
+
+# Caption labelling the intervention
+ax.text(ix0 + 2.55, iy0 + 1.30,
+        "Pre-projection shift (per step)",
+        fontsize=9, fontstyle="italic", color="#C2660E",
+        ha="center")
+
+# v injection arrow from top half down into the intervention
+_arrow(ax, 11.15, 4.30, ix0 + 4.40, iy0 + 1.05,
+       color="#3F7D3F", lw=1.6)
+ax.text(8.45, 3.80, "apply $v$ at every step",
+        fontsize=9, color="#3F7D3F", fontstyle="italic")
+
+# Latent in/out icons under the timeline
+_box(ax, 0.20, 0.55, 0.85, 0.55, "$z_T$", fc="#EFEFEF", fontsize=10)
+_box(ax, 11.85, 0.55, 0.85, 0.55, "$x_0$", fc="#EFEFEF", fontsize=10)
+_arrow(ax, 1.05, 0.825, xs[0] - 0.35, step_y + 0.10, color="#666", lw=1.0)
+_arrow(ax, xs[-1] + 0.50, step_y + 0.10, 11.85, 0.825, color="#666", lw=1.0)
+ax.text(0.625, 0.30, "noise", fontsize=8, ha="center", color="#555")
+ax.text(12.275, 0.30, "image", fontsize=8, ha="center", color="#555")
+
+fig.suptitle(
+    "Method overview — contrastive steering for FLUX text-encoder streams",
+    fontsize=12, fontweight="bold", y=0.995,
+)
+
+out_path = os.path.join(FIGS_DIR, "method_pipeline.png")
+plt.savefig(out_path, dpi=200, bbox_inches="tight", facecolor="white")
+plt.show()
+plt.close(fig)
+print(f"  Saved method diagram: {out_path}")
+
+
 """## Summary
 
 ### Key Results
