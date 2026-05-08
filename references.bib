@@ -1,0 +1,122 @@
+% references.bib
+% References cited in paper.tex.
+
+@inproceedings{esser2024scaling,
+  title     = {Scaling Rectified Flow Transformers for High-Resolution Image Synthesis},
+  author    = {Esser, Patrick and Kulal, Sumith and Blattmann, Andreas
+               and Entezari, Rahim and M{\"u}ller, Jonas and Saini, Harry
+               and Levi, Yam and Lorenz, Dominik and Sauer, Axel and Boesel, Frederic
+               and Podell, Dustin and Dockhorn, Tim and English, Zion and Rombach, Robin},
+  booktitle = {Proceedings of the 41st International Conference on Machine Learning},
+  year      = {2024},
+  note      = {Stable Diffusion 3 / MMDiT.}
+}
+
+@misc{fluxdev2024,
+  title  = {FLUX.1: A New State-of-the-Art Open-Weights Image Generation Model},
+  author = {{Black Forest Labs}},
+  year   = {2024},
+  howpublished = {\url{https://github.com/black-forest-labs/flux}},
+  note   = {FLUX.1 model card and reference implementation.}
+}
+
+@misc{greenberg2025flux,
+  title         = {Demystifying {FLUX} Architecture},
+  author        = {Greenberg, Eitan and others},
+  year          = {2025},
+  eprint        = {2507.09595},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG}
+}
+
+@article{turner2024steering,
+  title   = {Steering Language Models with Activation Engineering},
+  author  = {Turner, Alexander Matt and Thiergart, Lisa and Leech, Gavin
+             and Udell, David and Vazquez, Juan J. and Mini, Ulisse
+             and MacDiarmid, Monte},
+  journal = {arXiv preprint arXiv:2308.10248},
+  year    = {2024}
+}
+
+@inproceedings{panickssery2024steering,
+  title     = {Steering {LLaMA} 2 via Contrastive Activation Addition},
+  author    = {Panickssery, Nina and Gabrieli, Nick and Schulz, Julian
+               and Tong, Meg and Hubinger, Evan and Turner, Alexander Matt},
+  booktitle = {Annual Meeting of the Association for Computational Linguistics},
+  year      = {2024}
+}
+
+@misc{khrulkov2024casteer,
+  title         = {{CASteer}: Cross-Attention Steering for Controllable Concept Erasure
+                   in Diffusion Models},
+  author        = {Khrulkov, Valentin and others},
+  year          = {2024},
+  eprint        = {2503.09630},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CV},
+  note          = {Steering vectors via 50 ImageNet contrastive pairs;
+                   ablations on \(N\) and per-block cross-attention hooks.}
+}
+
+@inproceedings{tracepaper,
+  title     = {{TRACE}: Transcoder-Based Concept Editing for Concept Removal in
+               Diffusion and Image-Autoregressive Models},
+  author    = {Anonymous},
+  booktitle = {Submitted to the International Conference on Learning Representations (ICLR)},
+  year      = {2026},
+  note      = {Trains transcoders as drop-in replacements for the projection layer
+               and modulation MLP; reports the strongest UA on FLUX and SD3.5.
+               Appendix~D.1 reports the necessity of intervening on the modulation
+               MLP in addition to the projection layer.}
+}
+
+@inproceedings{zhang2024unlearncanvas,
+  title     = {{UnlearnCanvas}: A Stylized Image Dataset for Enhanced Machine
+               Unlearning Evaluation in Diffusion Models},
+  author    = {Zhang, Yihua and Fan, Chongyu and Zhang, Yimeng and Yao, Yuguang
+               and Jia, Jinghan and Liu, Jiancheng and Zhang, Gaoyuan and Liu, Gaowen
+               and Kompella, Ramana and Liu, Xiaoming and Liu, Sijia},
+  booktitle = {Advances in Neural Information Processing Systems},
+  year      = {2024},
+  eprint    = {2402.11846}
+}
+
+@inproceedings{gandikota2023erasing,
+  title     = {Erasing Concepts from Diffusion Models},
+  author    = {Gandikota, Rohit and Materzy{\'n}ska, Joanna and Fiotto-Kaufman, Jaden
+               and Bau, David},
+  booktitle = {IEEE/CVF International Conference on Computer Vision (ICCV)},
+  year      = {2023}
+}
+
+@inproceedings{kumari2023ablating,
+  title     = {Ablating Concepts in Text-to-Image Diffusion Models},
+  author    = {Kumari, Nupur and Zhang, Bingliang and Wang, Sheng-Yu
+               and Shechtman, Eli and Zhang, Richard and Zhu, Jun-Yan},
+  booktitle = {IEEE/CVF International Conference on Computer Vision (ICCV)},
+  year      = {2023}
+}
+
+@inproceedings{gandikota2024unified,
+  title     = {Unified Concept Editing in Diffusion Models},
+  author    = {Gandikota, Rohit and Orgad, Hadas and Belinkov, Yonatan
+               and Materzy{\'n}ska, Joanna and Bau, David},
+  booktitle = {IEEE/CVF Winter Conference on Applications of Computer Vision (WACV)},
+  year      = {2024}
+}
+
+@inproceedings{helbling2025conceptattention,
+  title     = {{ConceptAttention}: Diffusion Transformers Learn Highly Interpretable Features},
+  author    = {Helbling, Alec and Meral, Tuna Han Salih and Hoover, Ben
+               and Yanardag, Pinar and Chau, Duen Horng},
+  booktitle = {Submitted to the International Conference on Learning Representations (ICLR)},
+  year      = {2025},
+  eprint    = {2502.04320}
+}
+
+@inproceedings{cywinski2025saeuron,
+  title     = {{SAeUron}: Sparse Autoencoders for Concept Unlearning in Diffusion Models},
+  author    = {Cywi{\'n}ski, Bart{\l}omiej and Deja, Kamil},
+  booktitle = {Proceedings of the 42nd International Conference on Machine Learning},
+  year      = {2025}
+}
