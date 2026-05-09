@@ -3558,8 +3558,9 @@ else:
     )
 
     style_top_axes, object_top_axes = [], []
+    style_all_axes, object_all_axes = [], []
 
-    def _draw_half(panels, sub_spec, top_axes_sink):
+    def _draw_half(panels, sub_spec, top_axes_sink, all_axes_sink):
         if not panels:
             return
         inner = sub_spec.subgridspec(
@@ -3573,6 +3574,7 @@ else:
                 [(b_path, "Original"), (s_path, "Ours")]
             ):
                 ax = fig.add_subplot(inner[row, i])
+                all_axes_sink.append(ax)
                 ax.imshow(Image.open(path).convert("RGB"))
                 ax.set_xticks([]); ax.set_yticks([])
                 for s in ax.spines.values():
@@ -3609,9 +3611,12 @@ else:
                         fontsize=11, wrap=True,
                     )
 
-    _draw_half(style_panels,  outer[0],                top_axes_sink=style_top_axes)
+    _draw_half(style_panels,  outer[0],
+               top_axes_sink=style_top_axes,
+               all_axes_sink=style_all_axes)
     _draw_half(object_panels, outer[1] if have_both else outer[0],
-               top_axes_sink=object_top_axes)
+               top_axes_sink=object_top_axes,
+               all_axes_sink=object_all_axes)
 
     # Section headings are placed via fig.text() AFTER layout so they sit
     # immediately above each half regardless of the grid's actual y-extent.
@@ -3634,13 +3639,8 @@ else:
         )
 
     # Horizontal divider sitting in the gap between the two halves.
-    if have_both and style_top_axes and object_top_axes:
-        # Bottom of the Style half (under its caption row) and top of the
-        # Object half: split the difference for a clean midline.
-        s_bot = min(a.get_position().y0 for a in
-                    [ax for ax in fig.axes
-                     if ax.get_subplotspec().get_topmost_subplotspec()
-                        is outer[0].get_topmost_subplotspec()])
+    if have_both and style_all_axes and object_top_axes:
+        s_bot = min(a.get_position().y0 for a in style_all_axes)
         o_top = max(a.get_position().y1 for a in object_top_axes)
         y_line = (s_bot + o_top) / 2 - 0.005
         fig.add_artist(plt.Line2D(
