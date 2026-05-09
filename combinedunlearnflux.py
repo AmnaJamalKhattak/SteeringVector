@@ -3462,73 +3462,150 @@ def _find_pair(concept, target_type, preferred_partner=None, preferred_seed=None
     return be["path"], se["path"], prompt
 
 
-# Curate a mixed showcase: alternate style and object concepts.
-# Edit this list to feature the concepts you want in the headline figure.
-SHOWCASE_CONCEPTS = [
-    ("Van_Gogh",     "style",  "Dogs",       "Van Gogh"),
-    ("Dogs",         "object", "Van_Gogh",   "Dogs"),
-    ("Pop_Art",      "style",  "Human",      "Pop Art"),
-    ("Cats",         "object", "Cartoon",    "Cats"),
-    ("Ukiyoe",       "style",  "Flame",      "Ukiyoe"),
-    ("Butterfly",    "object", "Cubism",     "Butterfly"),
-    ("Impressionism","style",  "Cats",       "Impressionism"),
-    ("Jellyfish",    "object", "Watercolor", "Jellyfish"),
+# Curated showcase, split into two halves so the figure has separate
+# "Style Unlearning" and "Object Unlearning" headings.
+#
+# Each tuple is (concept, type, preferred_partner, label, preferred_seed).
+# `preferred_partner` and `preferred_seed` are the visually cleanest
+# example we picked from the eval grid for that concept; edit them to
+# swap a different Original | Ours pair into the figure without
+# regenerating anything. `_find_pair` falls back to the next best
+# available pair if the curated pick isn't on Drive.
+STYLE_SHOWCASE = [
+    ("Winter",        "style", "Horses",        "Winter",        688),
+    ("Pop_Art",       "style", "Architectures", "Pop Art",       288),
+    ("Ukiyoe",        "style", "Flame",         "Ukiyoe",        688),
+    ("Impressionism", "style", "Cats",          "Impressionism", 688),
 ]
+
+OBJECT_SHOWCASE = [
+    ("Horses",     "object", "Winter",     "Horses",    688),
+    ("Cats",       "object", "Watercolor", "Cats",      288),
+    ("Butterfly",  "object", "Cubism",     "Butterfly", 288),
+    ("Jellyfish",  "object", "Watercolor", "Jellyfish", 188),
+]
+
+
+def _resolve_panels(spec_list):
+    out = []
+    for concept, ttype, partner, label, seed in spec_list:
+        found = _find_pair(
+            concept, ttype,
+            preferred_partner=partner,
+            preferred_seed=seed,
+        )
+        if found is None:
+            print(f"  Skipping {concept:<14} ({ttype}) — "
+                  f"no baseline/steered pair on disk")
+            continue
+        b_path, s_path, prompt = found
+        out.append((label, ttype, prompt, b_path, s_path))
+        print(f"  Using   {concept:<14} ({ttype}) — "
+              f"{os.path.basename(b_path)}")
+    return out
+
 
 print("="*80)
 print("CELL 14 — MAIN SHOWCASE FIGURE")
 print("="*80)
+print("Style half:")
+style_panels = _resolve_panels(STYLE_SHOWCASE)
+print("Object half:")
+object_panels = _resolve_panels(OBJECT_SHOWCASE)
 
-panels = []
-for concept, ttype, partner, label in SHOWCASE_CONCEPTS:
-    found = _find_pair(concept, ttype, preferred_partner=partner)
-    if found is None:
-        print(f"  Skipping {concept:<14} ({ttype}) — no baseline/steered pair on disk")
-        continue
-    b_path, s_path, prompt = found
-    panels.append((label, ttype, prompt, b_path, s_path))
-    print(f"  Using   {concept:<14} ({ttype}) — {os.path.basename(b_path)}")
-
-if len(panels) == 0:
+if not style_panels and not object_panels:
     print("\nNo showcase pairs found on disk; run Cell 9 first.")
 else:
-    n_cols = len(panels)
-    fig = plt.figure(figsize=(2.6 * n_cols, 6.4))
+    # ----------------------------------------------------------------------
+    # Layout: a single figure with two heading halves (Style | Object),
+    # separated by a thin gap column. Section headings are placed via
+    # fig.text() AFTER tight_layout finalises subplot positions, so they
+    # always sit centred over their half.
+    # ----------------------------------------------------------------------
+    n_style = len(style_panels)
+    n_object = len(object_panels)
+    gap = 1 if (n_style and n_object) else 0
+    n_cols = n_style + gap + n_object
+
+    fig = plt.figure(figsize=(2.55 * n_cols, 7.0))
     gs = gridspec.GridSpec(
         2, n_cols,
+        figure=fig,
         height_ratios=[1.0, 1.0],
-        hspace=0.32, wspace=0.06,
+        hspace=0.34, wspace=0.07,
     )
 
-    # Header strip with "Original / Ours" labels above each column
-    for col, (label, ttype, prompt, b_path, s_path) in enumerate(panels):
-        for row, (path, sub) in enumerate([(b_path, "Original"), (s_path, "Ours")]):
-            ax = fig.add_subplot(gs[row, col])
-            ax.imshow(Image.open(path).convert("RGB"))
-            ax.set_xticks([]); ax.set_yticks([])
-            for s in ax.spines.values():
-                s.set_visible(False)
-            if row == 0:
-                # Two-line header: concept (bold) + Original/Ours subheader
-                ax.set_title(
-                    f"{label}\n$\\it{{Original}}$",
-                    fontsize=10, pad=4,
-                )
-            else:
-                ax.set_title(r"$\it{Ours}$", fontsize=10, pad=4)
+    # Track which axes belong to which half so we can read their positions
+    # back after layout to centre the section headings.
+    style_top_axes, object_top_axes = [], []
 
-            # Prompt caption only under bottom row, with target word emphasised
-            if row == 1:
-                short_prompt = prompt
-                # Highlight the concept inside the caption
-                key = label.replace("_", " ")
-                cap = short_prompt.replace(key, r"$\bf{" + key.replace(' ', '\\ ') + "}$")
-                ax.set_xlabel(cap, fontsize=8, labelpad=4)
+    def _draw_half(panels, col_offset, top_axes_sink):
+        for i, (label, ttype, prompt, b_path, s_path) in enumerate(panels):
+            col = col_offset + i
+            for row, (path, sub) in enumerate(
+                [(b_path, "Original"), (s_path, "Ours")]
+            ):
+                ax = fig.add_subplot(gs[row, col])
+                ax.imshow(Image.open(path).convert("RGB"))
+                ax.set_xticks([]); ax.set_yticks([])
+                for s in ax.spines.values():
+                    s.set_visible(False)
+                if row == 0:
+                    ax.set_title(
+                        f"{label}\n$\\it{{Original}}$",
+                        fontsize=10, pad=4,
+                    )
+                    top_axes_sink.append(ax)
+                else:
+                    ax.set_title(r"$\it{Ours}$", fontsize=10, pad=4)
+                    key = label.replace("_", " ")
+                    cap = prompt.replace(
+                        key, r"$\bf{" + key.replace(" ", r"\ ") + "}$"
+                    )
+                    ax.set_xlabel(cap, fontsize=8, labelpad=4)
+
+    _draw_half(style_panels,  col_offset=0,                top_axes_sink=style_top_axes)
+    _draw_half(object_panels, col_offset=n_style + gap,    top_axes_sink=object_top_axes)
+
+    # Reserve top space for the section headings, then finalise.
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.90))
+    fig.canvas.draw()
+
+    if style_top_axes:
+        s_left  = min(a.get_position().x0 for a in style_top_axes)
+        s_right = max(a.get_position().x1 for a in style_top_axes)
+        fig.text(
+            (s_left + s_right) / 2, 0.93, "Style Unlearning",
+            ha="center", va="bottom",
+            fontsize=15, fontweight="bold", color="#1F3A5F",
+        )
+
+    if object_top_axes:
+        o_left  = min(a.get_position().x0 for a in object_top_axes)
+        o_right = max(a.get_position().x1 for a in object_top_axes)
+        fig.text(
+            (o_left + o_right) / 2, 0.93, "Object Unlearning",
+            ha="center", va="bottom",
+            fontsize=15, fontweight="bold", color="#7A2E1F",
+        )
+
+    # Optional dashed separator between the two halves.
+    if gap and style_top_axes and object_top_axes:
+        x_line = (
+            max(a.get_position().x1 for a in style_top_axes)
+            + min(a.get_position().x0 for a in object_top_axes)
+        ) / 2
+        fig.add_artist(plt.Line2D(
+            [x_line, x_line], [0.05, 0.91],
+            color="#BBBBBB", lw=1.0, linestyle="--",
+            transform=fig.transFigure,
+        ))
 
     fig.suptitle(
-        "Our Method Removes Diverse Concepts: Styles, Objects, and Cross-Domain Combinations",
+        "Concept Unlearning with Steering Vectors on FLUX",
         fontsize=13, fontweight="bold", y=0.995,
     )
+
     out_path = os.path.join(FIGS_DIR, "main_showcase.png")
     plt.savefig(out_path, dpi=200, bbox_inches="tight", facecolor="white")
     plt.show()
