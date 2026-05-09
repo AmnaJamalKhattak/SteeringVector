@@ -3488,17 +3488,17 @@ def _find_pair(concept, target_type, preferred_partner=None, preferred_seed=None
 # regenerating anything. `_find_pair` falls back to the next best
 # available pair if the curated pick isn't on Drive.
 STYLE_SHOWCASE = [
-    ("Van_Gogh",      "style", "Birds",         "Van Gogh",      588),
-    ("Cubism",        "style", "Sea",           "Cubism",        288),
-    ("Pop_Art",       "style", "Architectures", "Pop Art",       288),
-    ("Ukiyoe",        "style", "Flame",         "Ukiyoe",        688),
+    ("Cubism",        "style", "Butterfly",     "Cubism",        588),
+    ("Pop_Art",       "style", "Horses",        "Pop_Art",       288),
+    ("Winter",        "style", "Architectures", "Winter",        688),
+    ("Bricks",        "style", "Birds",         "Bricks",        588),
 ]
 
 OBJECT_SHOWCASE = [
-    ("Dogs",       "object", "Watercolor",    "Dogs",       188),
-    ("Butterfly",  "object", "Cartoon",       "Butterfly",  288),
-    ("Jellyfish",  "object", "Impressionism", "Jellyfish",  188),
-    ("Horses",     "object", "Winter",        "Horses",     688),
+    ("Human",         "object", "Watercolor",   "Human",         688),
+    ("Jellyfish",     "object", "Van_Gogh",     "Jellyfish",     588),
+    ("Frogs",         "object", "Byzantine",    "Frogs",         288),
+    ("Flowers",       "object", "Bricks",       "Flowers",       188),
 ]
 
 
@@ -3533,94 +3533,111 @@ if not style_panels and not object_panels:
     print("\nNo showcase pairs found on disk; run Cell 9 first.")
 else:
     # ----------------------------------------------------------------------
-    # Layout: a single figure with two heading halves (Style | Object),
-    # separated by a thin gap column. Section headings are placed via
-    # fig.text() AFTER tight_layout finalises subplot positions, so they
-    # always sit centred over their half.
+    # Layout: two stacked grids -- Style Unlearning on top, Object
+    # Unlearning below. Each half is a 2 x N_cols grid of (Original, Ours)
+    # rows. Prompt captions sit beneath the Ours row with generous
+    # padding, and a horizontal divider separates the two halves.
     # ----------------------------------------------------------------------
-    n_style = len(style_panels)
+    n_style  = len(style_panels)
     n_object = len(object_panels)
-    gap = 1 if (n_style and n_object) else 0
-    n_cols = n_style + gap + n_object
+    n_cols   = max(n_style, n_object)
+    have_both = bool(n_style and n_object)
 
-    fig = plt.figure(figsize=(2.55 * n_cols, 7.0))
-    gs = gridspec.GridSpec(
-        2, n_cols,
+    PANEL_W   = 3.05      # inches per column
+    HALF_H    = 6.5       # inches per half (2 rows of images + caption band)
+    fig = plt.figure(figsize=(PANEL_W * n_cols, HALF_H * (2 if have_both else 1) + 1.0))
+
+    # Outer grid: one row per half, with a generous gap between them so
+    # the prompt captions of the Style half don't crowd the Object heading.
+    outer = gridspec.GridSpec(
+        2 if have_both else 1, 1,
         figure=fig,
-        height_ratios=[1.0, 1.0],
-        hspace=0.34, wspace=0.07,
+        height_ratios=[1.0, 1.0] if have_both else [1.0],
+        hspace=0.42,
+        top=0.93, bottom=0.04, left=0.04, right=0.98,
     )
 
-    # Track which axes belong to which half so we can read their positions
-    # back after layout to centre the section headings.
     style_top_axes, object_top_axes = [], []
 
-    def _draw_half(panels, col_offset, top_axes_sink):
+    def _draw_half(panels, sub_spec, top_axes_sink):
+        if not panels:
+            return
+        inner = sub_spec.subgridspec(
+            2, n_cols,
+            height_ratios=[1.0, 1.0],
+            hspace=0.55,   # vertical room for the caption beneath Ours
+            wspace=0.08,
+        )
         for i, (label, ttype, prompt, b_path, s_path) in enumerate(panels):
-            col = col_offset + i
             for row, (path, sub) in enumerate(
                 [(b_path, "Original"), (s_path, "Ours")]
             ):
-                ax = fig.add_subplot(gs[row, col])
+                ax = fig.add_subplot(inner[row, i])
                 ax.imshow(Image.open(path).convert("RGB"))
                 ax.set_xticks([]); ax.set_yticks([])
                 for s in ax.spines.values():
                     s.set_visible(False)
                 if row == 0:
                     ax.set_title(
-                        f"{label}\n$\\it{{Original}}$",
-                        fontsize=10, pad=4,
+                        f"{label.replace('_', ' ')}\n$\\it{{Original}}$",
+                        fontsize=12, pad=6,
                     )
                     top_axes_sink.append(ax)
                 else:
-                    ax.set_title(r"$\it{Ours}$", fontsize=10, pad=4)
+                    ax.set_title(r"$\it{Ours}$", fontsize=12, pad=6)
+
+                    # Prompt caption with the target word in bold. Wrap long
+                    # prompts so the layout stays tidy at narrow column widths.
                     key = label.replace("_", " ")
                     cap = prompt.replace(
-                        key, r"$\bf{" + key.replace(" ", r"\ ") + "}$"
+                        key, r"$\bf{" + key.replace(" ", r"\ ") + "}$",
                     )
-                    ax.set_xlabel(cap, fontsize=8, labelpad=4)
+                    ax.text(
+                        0.5, -0.10, cap,
+                        transform=ax.transAxes,
+                        ha="center", va="top",
+                        fontsize=11, wrap=True,
+                    )
 
-    _draw_half(style_panels,  col_offset=0,                top_axes_sink=style_top_axes)
-    _draw_half(object_panels, col_offset=n_style + gap,    top_axes_sink=object_top_axes)
+    _draw_half(style_panels,  outer[0],                top_axes_sink=style_top_axes)
+    _draw_half(object_panels, outer[1] if have_both else outer[0],
+               top_axes_sink=object_top_axes)
 
-    # Reserve top space for the section headings, then finalise.
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.90))
+    # Section headings are placed via fig.text() AFTER layout so they sit
+    # immediately above each half regardless of the grid's actual y-extent.
     fig.canvas.draw()
 
     if style_top_axes:
-        s_left  = min(a.get_position().x0 for a in style_top_axes)
-        s_right = max(a.get_position().x1 for a in style_top_axes)
+        s_top = max(a.get_position().y1 for a in style_top_axes)
         fig.text(
-            (s_left + s_right) / 2, 0.93, "Style Unlearning",
+            0.5, min(s_top + 0.025, 0.985), "Style Unlearning",
             ha="center", va="bottom",
-            fontsize=15, fontweight="bold", color="#1F3A5F",
+            fontsize=18, fontweight="bold", color="#1F3A5F",
         )
 
     if object_top_axes:
-        o_left  = min(a.get_position().x0 for a in object_top_axes)
-        o_right = max(a.get_position().x1 for a in object_top_axes)
+        o_top = max(a.get_position().y1 for a in object_top_axes)
         fig.text(
-            (o_left + o_right) / 2, 0.93, "Object Unlearning",
+            0.5, o_top + 0.020, "Object Unlearning",
             ha="center", va="bottom",
-            fontsize=15, fontweight="bold", color="#7A2E1F",
+            fontsize=18, fontweight="bold", color="#7A2E1F",
         )
 
-    # Optional dashed separator between the two halves.
-    if gap and style_top_axes and object_top_axes:
-        x_line = (
-            max(a.get_position().x1 for a in style_top_axes)
-            + min(a.get_position().x0 for a in object_top_axes)
-        ) / 2
+    # Horizontal divider sitting in the gap between the two halves.
+    if have_both and style_top_axes and object_top_axes:
+        # Bottom of the Style half (under its caption row) and top of the
+        # Object half: split the difference for a clean midline.
+        s_bot = min(a.get_position().y0 for a in
+                    [ax for ax in fig.axes
+                     if ax.get_subplotspec().get_topmost_subplotspec()
+                        is outer[0].get_topmost_subplotspec()])
+        o_top = max(a.get_position().y1 for a in object_top_axes)
+        y_line = (s_bot + o_top) / 2 - 0.005
         fig.add_artist(plt.Line2D(
-            [x_line, x_line], [0.05, 0.91],
+            [0.06, 0.96], [y_line, y_line],
             color="#BBBBBB", lw=1.0, linestyle="--",
             transform=fig.transFigure,
         ))
-
-    fig.suptitle(
-        "Concept Unlearning with Steering Vectors on FLUX",
-        fontsize=13, fontweight="bold", y=0.995,
-    )
 
     out_path = os.path.join(FIGS_DIR, "main_showcase.png")
     plt.savefig(out_path, dpi=200, bbox_inches="tight", facecolor="white")
