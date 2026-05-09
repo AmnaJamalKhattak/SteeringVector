@@ -3322,46 +3322,56 @@ def _build_drive_image_index(verbose=True):
     """
     Walk BASELINE_DIR / RESULTS_DIR / STEERED_DIR once and return:
 
-        baseline[concept] = list of {path, fname, first, second, seed}
-        steered [concept] = list of {path, fname, first, second, seed, mode_dir}
+        baseline_by_fname[fname] = {path, fname, first, second, seed, src_dir}
+        steered[concept]         = list of {path, fname, first, second, seed,
+                                            mode_dir}
 
-    Files are classified by which top-level directory they live under, so
-    the layout requirement is exactly the one the rest of this script writes:
+    Baselines are kept as a *flat* filename map because the full-benchmark
+    runner pools every baseline image into BASELINE_DIR/_shared_grid/ (one
+    shared grid for all concepts). Per-concept baseline folders, when they
+    exist, are folded into the same map. We pair a steered image with a
+    baseline by exact filename match, so any layout under BASELINE_DIR
+    works as long as the filenames line up.
 
-        BASELINE_DIR/{concept}/*.jpg
-        RESULTS_DIR/{concept}_{mode}/*.jpg          (or STEERED_DIR/...)
-
-    Anything else (extra directories, custom filename forms) is reported in
-    verbose mode but not used.
+    Steered images keep their per-concept indexing (recovered from the
+    {concept}_{mode} directory name).
     """
-    baseline = {}
-    steered = {}
-    skipped = 0
+    baseline_by_fname = {}   # fname -> entry
+    steered = {}             # concept -> [entries]
+    parsed_skipped = 0
+    baseline_src_dirs = []
 
-    # ---- Baselines: BASELINE_DIR/{concept}/*.jpg --------------------
+    # ---- Baselines: walk BASELINE_DIR recursively (depth >= 1) ----------
     if os.path.isdir(BASELINE_DIR):
-        for concept in os.listdir(BASELINE_DIR):
-            full = os.path.join(BASELINE_DIR, concept)
+        for sub in sorted(os.listdir(BASELINE_DIR)):
+            full = os.path.join(BASELINE_DIR, sub)
             if not os.path.isdir(full):
                 continue
+            n_added = 0
             for fname in os.listdir(full):
                 if not fname.lower().endswith(_IMG_EXTS):
                     continue
                 first, second, seed = _parse_pair_filename(fname)
                 if seed is None:
-                    skipped += 1
+                    parsed_skipped += 1
                     continue
-                baseline.setdefault(concept, []).append({
+                # Last writer wins on duplicates; per-concept overrides
+                # _shared_grid only if it appears later in sort order.
+                baseline_by_fname[fname] = {
                     "path": os.path.join(full, fname),
                     "fname": fname,
                     "first": first, "second": second, "seed": seed,
-                })
+                    "src_dir": sub,
+                }
+                n_added += 1
+            if n_added:
+                baseline_src_dirs.append((sub, n_added))
 
-    # ---- Steered: RESULTS_DIR / STEERED_DIR / {concept}_{mode}/*.jpg
+    # ---- Steered: RESULTS_DIR / STEERED_DIR / {concept}_{mode}/*.jpg ----
     for base in (RESULTS_DIR, STEERED_DIR):
         if not os.path.isdir(base):
             continue
-        for entry in os.listdir(base):
+        for entry in sorted(os.listdir(base)):
             full = os.path.join(base, entry)
             if not os.path.isdir(full):
                 continue
@@ -3371,7 +3381,7 @@ def _build_drive_image_index(verbose=True):
                     continue
                 first, second, seed = _parse_pair_filename(fname)
                 if seed is None:
-                    skipped += 1
+                    parsed_skipped += 1
                     continue
                 steered.setdefault(concept, []).append({
                     "path": os.path.join(full, fname),
@@ -3388,63 +3398,59 @@ def _build_drive_image_index(verbose=True):
               f"(exists={os.path.isdir(RESULTS_DIR)})")
         print(f"  Steered  dir    : {STEERED_DIR} "
               f"(exists={os.path.isdir(STEERED_DIR)})")
-        b_total = sum(len(v) for v in baseline.values())
         s_total = sum(len(v) for v in steered.values())
-        print(f"  Indexed         : {b_total} baseline files across "
-              f"{len(baseline)} concepts; {s_total} steered files across "
+        print(f"  Indexed         : {len(baseline_by_fname)} baseline files "
+              f"(flat); {s_total} steered files across "
               f"{len(steered)} concepts")
-        if skipped:
-            print(f"  Skipped         : {skipped} files (filename did not parse)")
-        if baseline:
-            preview = ", ".join(sorted(baseline)[:8])
-            print(f"  Baseline concepts: {preview}"
-                  + (" ..." if len(baseline) > 8 else ""))
+        if baseline_src_dirs:
+            srcs = ", ".join(f"{d}({n})" for d, n in baseline_src_dirs[:6])
+            print(f"  Baseline pools  : {srcs}"
+                  + (" ..." if len(baseline_src_dirs) > 6 else ""))
+        if parsed_skipped:
+            print(f"  Skipped         : {parsed_skipped} files "
+                  f"(filename did not parse)")
         if steered:
             preview = ", ".join(sorted(steered)[:8])
-            print(f"  Steered  concepts: {preview}"
+            print(f"  Steered concepts: {preview}"
                   + (" ..." if len(steered) > 8 else ""))
 
-    return baseline, steered
+    return baseline_by_fname, steered
 
 
 # Build the index once — re-used by Cell 14 and Cell 16.
 print("Indexing images on Drive...")
-_BASELINE_INDEX, _STEERED_INDEX = _build_drive_image_index(verbose=True)
+_BASELINE_BY_FNAME, _STEERED_INDEX = _build_drive_image_index(verbose=True)
 
 
 def _find_pair(concept, target_type, preferred_partner=None, preferred_seed=None):
     """
-    Find an (Original, Ours, prompt) triple for a concept by joining the
-    baseline and steered indexes on filename. Falls back gracefully when
-    a preferred partner / seed is unavailable.
+    Find an (Original, Ours, prompt) triple for a concept. Joins steered
+    entries to baseline by exact filename match, so this works whether
+    baselines live in a shared pool (_shared_grid) or per-concept folders.
     """
-    base_entries = _BASELINE_INDEX.get(concept, [])
     steer_entries = _STEERED_INDEX.get(concept, [])
-    if not base_entries or not steer_entries:
+    if not steer_entries or not _BASELINE_BY_FNAME:
         return None
 
-    steer_by_fname = {e["fname"]: e["path"] for e in steer_entries}
-
     scored = []
-    for be in base_entries:
-        s_path = steer_by_fname.get(be["fname"])
-        if s_path is None:
+    for se in steer_entries:
+        be = _BASELINE_BY_FNAME.get(se["fname"])
+        if be is None:
             continue
-        partner = be["first"] if target_type == "object" else be["second"]
+        partner = se["first"] if target_type == "object" else se["second"]
         score = 0
         if preferred_partner and partner == preferred_partner:
             score += 10
-        if preferred_seed is not None and be["seed"] == preferred_seed:
+        if preferred_seed is not None and se["seed"] == preferred_seed:
             score += 5
-        # Prefer EVAL_SEEDS so we hit the canonical reproducibility seeds first.
-        if be["seed"] in EVAL_SEEDS:
+        if se["seed"] in EVAL_SEEDS:
             score += 1
-        scored.append((score, partner, be, s_path))
+        scored.append((score, partner, be, se))
 
     if not scored:
         return None
     scored.sort(key=lambda x: -x[0])
-    _, partner, be, s_path = scored[0]
+    _, partner, be, se = scored[0]
 
     partner_str = (partner or "image").replace("_", " ")
     if target_type == "style":
@@ -3453,7 +3459,7 @@ def _find_pair(concept, target_type, preferred_partner=None, preferred_seed=None
     else:
         prompt = (f"A {concept.replace('_', ' ')} image in "
                   f"{partner_str} style.")
-    return be["path"], s_path, prompt
+    return be["path"], se["path"], prompt
 
 
 # Curate a mixed showcase: alternate style and object concepts.
@@ -3671,13 +3677,13 @@ def _list_pairs_for_concept(concept, target_type, max_rows=4):
     Return up to `max_rows` (partner, prompt, b_path, s_path) entries built
     from the in-memory drive index. One row per partner concept; preference
     given to EVAL_SEEDS but any seed available on disk is accepted.
-    """
-    base_entries = _BASELINE_INDEX.get(concept, [])
-    steer_entries = _STEERED_INDEX.get(concept, [])
-    if not base_entries or not steer_entries:
-        return []
 
-    steer_by_fname = {e["fname"]: e["path"] for e in steer_entries}
+    Steered entries are joined to the flat baseline-by-filename map, so
+    this works with the shared `_shared_grid` baseline pool.
+    """
+    steer_entries = _STEERED_INDEX.get(concept, [])
+    if not steer_entries or not _BASELINE_BY_FNAME:
+        return []
 
     if target_type == "style":
         partner_key = "second"
@@ -3692,29 +3698,30 @@ def _list_pairs_for_concept(concept, target_type, max_rows=4):
             f"{(partner or 'standard').replace('_', ' ')} style."
         )
 
-    # Group baseline entries by partner; sort each group so EVAL_SEEDS come first.
+    # Group steered entries by partner; pick the best seed in each group.
     by_partner = {}
-    for be in base_entries:
-        if be["fname"] not in steer_by_fname:
+    for se in steer_entries:
+        if se["fname"] not in _BASELINE_BY_FNAME:
             continue
-        partner = be[partner_key]
+        partner = se[partner_key]
         if partner is None:
             continue
-        by_partner.setdefault(partner, []).append(be)
+        by_partner.setdefault(partner, []).append(se)
 
-    def _seed_priority(be):
+    def _seed_priority(se):
         try:
-            return EVAL_SEEDS.index(be["seed"])
+            return EVAL_SEEDS.index(se["seed"])
         except ValueError:
-            return len(EVAL_SEEDS) + be["seed"]
+            return len(EVAL_SEEDS) + se["seed"]
 
     rows = []
     for partner in sorted(by_partner):
         entries = sorted(by_partner[partner], key=_seed_priority)
-        be = entries[0]
+        se = entries[0]
+        be = _BASELINE_BY_FNAME[se["fname"]]
         rows.append((
             partner, prompt_fn(partner),
-            be["path"], steer_by_fname[be["fname"]],
+            be["path"], se["path"],
         ))
         if len(rows) >= max_rows:
             break
