@@ -3569,7 +3569,7 @@ else:
             wspace=0.08,
         )
         for i, (label, ttype, prompt, b_path, s_path) in enumerate(panels):
-            for row, (path, sub) in enumerate(
+            for row, (path, row_label) in enumerate(
                 [(b_path, "Original"), (s_path, "Ours")]
             ):
                 ax = fig.add_subplot(inner[row, i])
@@ -3577,17 +3577,27 @@ else:
                 ax.set_xticks([]); ax.set_yticks([])
                 for s in ax.spines.values():
                     s.set_visible(False)
+
+                # Concept name as the column header -- only above the first
+                # row (the Original image of each panel).
                 if row == 0:
                     ax.set_title(
-                        f"{label.replace('_', ' ')}\n$\\it{{Original}}$",
-                        fontsize=12, pad=6,
+                        label.replace("_", " "),
+                        fontsize=13, fontweight="bold", pad=6,
                     )
                     top_axes_sink.append(ax)
-                else:
-                    ax.set_title(r"$\it{Ours}$", fontsize=12, pad=6)
 
-                    # Prompt caption with the target word in bold. Wrap long
-                    # prompts so the layout stays tidy at narrow column widths.
+                # "Original" / "Ours" row labels -- only on the first column,
+                # rotated and rendered in italic for a clean side gutter.
+                if i == 0:
+                    ax.set_ylabel(
+                        row_label,
+                        fontsize=13, fontstyle="italic",
+                        rotation=90, labelpad=10,
+                    )
+
+                # Prompt caption beneath the Ours image of every panel.
+                if row == 1:
                     key = label.replace("_", " ")
                     cap = prompt.replace(
                         key, r"$\bf{" + key.replace(" ", r"\ ") + "}$",
