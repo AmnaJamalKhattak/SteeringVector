@@ -3427,17 +3427,33 @@ def _find_pair(concept, target_type, preferred_partner=None, preferred_seed=None
     Find an (Original, Ours, prompt) triple for a concept. Joins steered
     entries to baseline by exact filename match, so this works whether
     baselines live in a shared pool (_shared_grid) or per-concept folders.
+
+    The full benchmark renders the WHOLE 10x20x5 grid for every target
+    concept, so RESULTS_DIR/Cats_pincer_perstep/Cartoon_Architectures_seed*.jpg
+    exists even though it depicts Architectures, not cats. We filter so
+    only filenames whose target-position token matches `concept` are
+    considered:
+      - target_type == "style"  -> first  token in filename must be `concept`
+      - target_type == "object" -> second token in filename must be `concept`
     """
     steer_entries = _STEERED_INDEX.get(concept, [])
     if not steer_entries or not _BASELINE_BY_FNAME:
         return None
 
+    if target_type == "style":
+        target_key, partner_key = "first", "second"
+    else:
+        target_key, partner_key = "second", "first"
+
     scored = []
     for se in steer_entries:
+        # Enforce that the file actually depicts the target concept.
+        if se.get(target_key) != concept:
+            continue
         be = _BASELINE_BY_FNAME.get(se["fname"])
         if be is None:
             continue
-        partner = se["first"] if target_type == "object" else se["second"]
+        partner = se.get(partner_key)
         score = 0
         if preferred_partner and partner == preferred_partner:
             score += 10
@@ -3763,24 +3779,28 @@ def _list_pairs_for_concept(concept, target_type, max_rows=4):
         return []
 
     if target_type == "style":
-        partner_key = "second"
+        target_key, partner_key = "first", "second"
         prompt_fn = lambda partner: (
             f"A {(partner or 'image').replace('_', ' ')} image in "
             f"{concept.replace('_', ' ')} style."
         )
     else:
-        partner_key = "first"
+        target_key, partner_key = "second", "first"
         prompt_fn = lambda partner: (
             f"A {concept.replace('_', ' ')} image in "
             f"{(partner or 'standard').replace('_', ' ')} style."
         )
 
     # Group steered entries by partner; pick the best seed in each group.
+    # Only entries whose target token actually matches `concept` are kept,
+    # so we never display a Cartoon-Architectures image as a "Cats" result.
     by_partner = {}
     for se in steer_entries:
+        if se.get(target_key) != concept:
+            continue
         if se["fname"] not in _BASELINE_BY_FNAME:
             continue
-        partner = se[partner_key]
+        partner = se.get(partner_key)
         if partner is None:
             continue
         by_partner.setdefault(partner, []).append(se)
