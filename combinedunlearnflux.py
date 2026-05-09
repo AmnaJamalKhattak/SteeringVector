@@ -3488,17 +3488,17 @@ def _find_pair(concept, target_type, preferred_partner=None, preferred_seed=None
 # regenerating anything. `_find_pair` falls back to the next best
 # available pair if the curated pick isn't on Drive.
 STYLE_SHOWCASE = [
-    ("Winter",        "style", "Horses",        "Winter",        688),
+    ("Van_Gogh",      "style", "Birds",         "Van Gogh",      588),
+    ("Cubism",        "style", "Sea",           "Cubism",        288),
     ("Pop_Art",       "style", "Architectures", "Pop Art",       288),
     ("Ukiyoe",        "style", "Flame",         "Ukiyoe",        688),
-    ("Impressionism", "style", "Cats",          "Impressionism", 688),
 ]
 
 OBJECT_SHOWCASE = [
-    ("Horses",     "object", "Winter",     "Horses",    688),
-    ("Cats",       "object", "Watercolor", "Cats",      288),
-    ("Butterfly",  "object", "Cubism",     "Butterfly", 288),
-    ("Jellyfish",  "object", "Watercolor", "Jellyfish", 188),
+    ("Dogs",       "object", "Watercolor",    "Dogs",       188),
+    ("Butterfly",  "object", "Cartoon",       "Butterfly",  288),
+    ("Jellyfish",  "object", "Impressionism", "Jellyfish",  188),
+    ("Horses",     "object", "Winter",        "Horses",     688),
 ]
 
 
